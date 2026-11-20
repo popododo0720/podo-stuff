@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""Unit tests for podo-guard deterministic comment, dead-code, DAG, config, and Stop hook gates."""
+
+from __future__ import annotations
+
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+from typing import Any
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+GUARD_SCRIPT = PLUGIN_ROOT / "scripts" / "podo-guard.py"
+
+
+def load_guard_module() -> Any:
+    """Dynamically load scripts/podo-guard.py as a Python module for direct testing."""
+    spec = importlib.util.spec_from_file_location("podo_guard", GUARD_SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+GUARD = load_guard_module()
+
+
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Execute a git command in repo with deterministic author identity."""
+    env = dict(os.environ)
+    env.setdefault("GIT_AUTHOR_NAME", "Test User")
+    env.setdefault("GIT_AUTHOR_EMAIL", "test@example.com")
+    env.setdefault("GIT_COMMITTER_NAME", "Test User")
+    env.setdefault("GIT_COMMITTER_EMAIL", "test@example.com")
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+
+def init_git_repo(repo: Path) -> None:
+    """Initialize a temporary git repository ready for commits."""
+    run_git(repo, "init")
+    run_git(repo, "config", "user.name", "Test User")
+    run_git(repo, "config", "user.email", "test@example.com")
+
+
+def run_cli(
+    args: list[str],
+    stdin_text: str | None = None,
+    env_overrides: dict[str, str | None] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Invoke scripts/podo-guard.py in a subprocess with clean environment controls."""
+    env = dict(os.environ)
+    env.pop("PODO_GUARD_MODE", None)
+    env.pop("PODO_ROLE", None)
+    if env_overrides:
+        for key, val in env_overrides.items():
+            if val is None:
+                env.pop(key, None)
+            else:
+                env[key] = val
+    return subprocess.run(
+        [sys.executable, str(GUARD_SCRIPT), *args],
+        input=stdin_text,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+class CommentParserTests(unittest.TestCase):
+    """Verify comment gate allow tags, Python tokenization, and brace-language scanners."""
+
+    def test_allow_tags_checked_before_dead_code_patterns(self) -> None:
+        tags = GUARD.DEFAULT_ALLOW_TAGS
+        ok, reason, always_block = GUARD.is_allowed_comment(
+            "// WHY: if cache misses; fall back",
+            tags,
+        )
+        self.assertTrue(ok, msg=reason)
+        self.assertFalse(always_block)
+
+        ok_inv, _, _ = GUARD.is_allowed_comment("// INVARIANT: return early;", tags)
+        self.assertTrue(ok_inv)
+
+        ok_dead, dead_reason, dead_always = GUARD.is_allowed_comment(
+            "// if cache misses; fall back",
+            tags,
+        )
+        self.assertFalse(ok_dead)
+        self.assertTrue(dead_always)
+        self.assertIn("Commented-out code", dead_reason)
+
+        ok_todo, _, todo_always = GUARD.is_allowed_comment(
+            "// WHY: TODO clean up later",
+            tags,
+        )
+        self.assertFalse(ok_todo)
+        self.assertTrue(todo_always)
+
+    def test_python_partial_dedent_diff_trailing_comment_and_string_literal(self) -> None:
+        diff_text = "\n".join(
+            [
+                "+++ b/app.py",
+                "@@ -10,0 +11,3 @@",
+                '+    url = "https://example.com/#fragment"',
+                "+    total = compute()  # trailing narration",
+                "+    other = compute()  # WHY: needed for protocol;",
+            ]
+        )
+        violations = GUARD.run_comment_gate(
+            Path("."),
+            GUARD.DEFAULT_ALLOW_TAGS,
+            diff_text=diff_text,
+        )
+        self.assertEqual(len(violations), 1)
+        self.assertIn("app.py:12:", violations[0])
+        self.assertIn("# trailing narration", violations[0])
+
+    def test_python_full_file_relies_on_func_ranges_not_generic_indentation(self) -> None:
+        source = "\n".join(
+            [
+                "CONFIG = {",
+                "    # section label outside function",
+                '    "alpha": 1,',
+                "}",
+                "def run():",
+                "    # narration inside function",
+                "    return CONFIG",
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(source.splitlines())}
+        violations = GUARD.check_python_comments("cfg.py", added, source, GUARD.DEFAULT_ALLOW_TAGS)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("cfg.py:6:", violations[0])
+
+    def test_js_regex_literal_does_not_open_comment(self) -> None:
+        js_source = "\n".join(
+            [
+                "function parseUrl(input) {",
+                "  const re = /https?:\\/\\//gi;",
+                "  const ok = /a[x/y]b/.test(input);",
+                "  const ratio = 10 / 2; // narration after division",
+                "  return re.test(input) && ok && ratio > 0;",
+                "}",
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(js_source.splitlines())}
+        violations = GUARD.check_brace_comments("url.js", added, js_source, GUARD.DEFAULT_ALLOW_TAGS)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("url.js:4:", violations[0])
+        self.assertIn("narration after division", violations[0])
+
+    def test_rust_lifetimes_and_escaped_chars_do_not_open_string_state(self) -> None:
+        rs_source = "\n".join(
+            [
+                "fn parse<'a>(input: &'a str) -> &'static str {",
+                "    let quote = '\\'';",
+                "    let dbl = '\"';",
+                "    // narration after lifetimes",
+                "    let _ = (quote, dbl, input);",
+                '    "ok"',
+                "}",
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(rs_source.splitlines())}
+        violations = GUARD.check_brace_comments("lib.rs", added, rs_source, GUARD.DEFAULT_ALLOW_TAGS)
+        self.assertEqual(len(violations), 1)
+        self.assertIn("lib.rs:4:", violations[0])
+        self.assertIn("narration after lifetimes", violations[0])
+
+    def test_jsdoc_blocked_inside_function_and_multiline_block_emits_all_lines(self) -> None:
+        ts_source = "\n".join(
+            [
+                "/** Top-level doc comment */",
+                "export function work(): number {",
+                "  /** JSDoc inside function body */",
+                "  /*",
+                "   * multi-line narration line one",
+                "   * multi-line narration line two",
+                "   */",
+                "  /* WHY:",
+                "   * intentional multi-line rationale",
+                "   */",
+                "  return 42;",
+                "}",
+            ]
+        )
+        scanned = GUARD.scan_brace_language_comments(ts_source, suffix=".ts")
+        scanned_lines = {entry[0] for entry in scanned}
+        self.assertNotIn(1, scanned_lines)
+        self.assertIn(3, scanned_lines)
+        self.assertTrue({4, 5, 6, 7}.issubset(scanned_lines))
+
+        only_interior_added = {3: ts_source.splitlines()[2], 6: ts_source.splitlines()[5], 9: ts_source.splitlines()[8]}
+        violations = GUARD.check_brace_comments("work.ts", only_interior_added, ts_source, GUARD.DEFAULT_ALLOW_TAGS)
+        self.assertEqual(len(violations), 2)
+        self.assertTrue(any("work.ts:3:" in v for v in violations))
+        self.assertTrue(any("work.ts:6:" in v for v in violations))
+        self.assertFalse(any("work.ts:9:" in v for v in violations))
+
+
+class PythonDeadCodeGateTests(unittest.TestCase):
+    """Verify AST-based Python dead-code detection and exemptions."""
+
+    def test_detects_unreachable_unused_import_and_unused_private_helper(self) -> None:
+        source = "\n".join(
+            [
+                "import os",
+                "import math",
+                "",
+                "def _unused_helper(x: int) -> int:",
+                "    return x + 1",
+                "",
+                "def _used_helper(x: int) -> int:",
+                "    return x * 2",
+                "",
+                "def __dunder_hook__() -> int:",
+                "    return 0",
+                "",
+                "def compute(val: int) -> int:",
+                "    out = _used_helper(val) + int(math.sqrt(4))",
+                "    return out",
+                "    never_runs = 99",
+                "    return never_runs",
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(source.splitlines())}
+        violations = GUARD.check_python_dead_code("module.py", added, source)
+        self.assertTrue(any("[DEAD-CODE] module.py:1: Unused import 'os'" in v for v in violations), violations)
+        self.assertTrue(
+            any("[DEAD-CODE] module.py:4: Unused private helper function '_unused_helper'" in v for v in violations),
+            violations,
+        )
+        self.assertTrue(
+            any("[DEAD-CODE] module.py:16: Unreachable statement immediately following 'return'" in v for v in violations),
+            violations,
+        )
+        self.assertFalse(any("_used_helper" in v for v in violations))
+        self.assertFalse(any("__dunder_hook__" in v for v in violations))
+        self.assertFalse(any("'math'" in v for v in violations))
+
+    def test_unreachable_after_raise_break_continue(self) -> None:
+        source = "\n".join(
+            [
+                "def f(items):",
+                "    for x in items:",
+                "        if x == 0:",
+                "            continue",
+                "            a = 1",
+                "        if x < 0:",
+                "            break",
+                "            b = 2",
+                "    raise ValueError('bad')",
+                "    c = 3",
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(source.splitlines())}
+        violations = GUARD.check_python_dead_code("flow.py", added, source)
+        self.assertEqual(len(violations), 3, violations)
+        self.assertTrue(any("following 'continue'" in v for v in violations))
+        self.assertTrue(any("following 'break'" in v for v in violations))
+        self.assertTrue(any("following 'raise'" in v for v in violations))
+
+    def test_unused_import_exemptions(self) -> None:
+        source = "\n".join(
+            [
+                "from __future__ import annotations",
+                "from typing import TYPE_CHECKING",
+                "import json  # noqa: F401",
+                "import pathlib",
+                "",
+                "if TYPE_CHECKING:",
+                "    import decimal",
+                "",
+                '__all__ = ["pathlib"]',
+            ]
+        )
+        added = {i + 1: line for i, line in enumerate(source.splitlines())}
+        violations = GUARD.check_python_dead_code("pkg/mod.py", added, source)
+        self.assertEqual(violations, [])
+
+        init_source = "import unused_export\n"
+        init_added = {1: "import unused_export"}
+        init_violations = GUARD.check_python_dead_code("pkg/__init__.py", init_added, init_source)
+        self.assertEqual(init_violations, [])
+
+    def test_diff_text_runs_dead_code_when_valid_python(self) -> None:
+        diff_text = "\n".join(
+            [
+                "+++ b/snippet.py",
+                "@@ -0,0 +1,5 @@",
+                "+import sys",
+                "+def f():",
+                "+    return 1",
+                "+    x = 2",
+            ]
+        )
+        violations = GUARD.run_comment_and_dead_code_gates(
+            Path("."),
+            GUARD.DEFAULT_ALLOW_TAGS,
+            diff_text=diff_text,
+            dead_code_enabled=True,
+        )
+        self.assertTrue(any("[DEAD-CODE] snippet.py:1: Unused import 'sys'" in v for v in violations))
+        self.assertTrue(any("[DEAD-CODE] snippet.py:4: Unreachable" in v for v in violations))
+
+
+class GitBaseCheckTests(unittest.TestCase):
+    """Verify check --base <ref>, --files, and --mode observe on a git repository."""
+
+    def test_check_base_detects_committed_changes_and_supports_files_and_observe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            init_git_repo(repo)
+            (repo / "base.py").write_text("def clean() -> int:\n    return 1\n", encoding="utf-8")
+            run_git(repo, "add", "base.py")
+            run_git(repo, "commit", "-m", "initial")
+            base_sha = run_git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            (repo / "feature.py").write_text(
+                "import os\n\ndef work() -> int:\n    # narration committed\n    return 2\n",
+                encoding="utf-8",
+            )
+            (repo / "clean_feature.py").write_text(
+                "def ok() -> int:\n    return 3\n",
+                encoding="utf-8",
+            )
+            run_git(repo, "add", "feature.py", "clean_feature.py")
+            run_git(repo, "commit", "-m", "feature commit")
+
+            no_base = run_cli(["check", "--repo", str(repo)])
+            self.assertEqual(no_base.returncode, 0, no_base.stdout + no_base.stderr)
+
+            with_base = run_cli(["check", "--repo", str(repo), "--base", base_sha])
+            self.assertEqual(with_base.returncode, 1)
+            self.assertIn("[NO-COMMENTS] feature.py:4:", with_base.stdout)
+            self.assertIn("[DEAD-CODE] feature.py:1:", with_base.stdout)
+
+            only_clean = run_cli(["check", "--repo", str(repo), "--base", base_sha, "--files", "clean_feature.py"])
+            self.assertEqual(only_clean.returncode, 0, only_clean.stdout + only_clean.stderr)
+
+            observe_proc = run_cli(["check", "--repo", str(repo), "--base", base_sha, "--mode", "observe"])
+            self.assertEqual(observe_proc.returncode, 0)
+            self.assertIn("OBSERVE", observe_proc.stdout)
+            self.assertIn("feature.py:4:", observe_proc.stdout)
+
+            bad_base = run_cli(["check", "--repo", str(repo), "--base", "doesnotexist123"])
+            self.assertEqual(bad_base.returncode, 1)
+            self.assertIn("[GIT-BASE] invalid base ref 'doesnotexist123'", bad_base.stdout)
+
+
+class StopHookTests(unittest.TestCase):
+    """Verify Stop hook turn-scoping, observe/off modes, role skip, malformed JSON, and deadline budget."""
+
+    def _make_dirty_repo(self, repo: Path) -> None:
+        init_git_repo(repo)
+        (repo / "clean.py").write_text("def clean() -> int:\n    return 1\n", encoding="utf-8")
+        (repo / "dirty.py").write_text("def dirty() -> int:\n    return 1\n", encoding="utf-8")
+        run_git(repo, "add", "clean.py", "dirty.py")
+        run_git(repo, "commit", "-m", "base")
+        (repo / "clean.py").write_text("def clean() -> int:\n    return 2\n", encoding="utf-8")
+        (repo / "dirty.py").write_text(
+            "def dirty() -> int:\n    # bad narration\n    return 2\n",
+            encoding="utf-8",
+        )
+
+    def test_read_only_turn_skipped_and_edited_turn_scoped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            self._make_dirty_repo(repo)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+
+            ro_transcript = root / "ro.jsonl"
+            ro_transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "USER_INPUT", "content": "explain clean.py"}),
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "tool_calls": [{"name": "read_file", "args": {"Path": json.dumps(str(repo / "clean.py"))}}],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ro_payload = json.dumps(
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "cwd": str(repo),
+                    "transcriptPath": str(ro_transcript),
+                }
+            )
+            ro_proc = run_cli(["--config", str(cfg_path), "--hook-stop"], stdin_text=ro_payload)
+            self.assertEqual(ro_proc.returncode, 0)
+            self.assertEqual(json.loads(ro_proc.stdout), {})
+
+            clean_edit_transcript = root / "clean_edit.jsonl"
+            clean_edit_transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "USER_INPUT", "content": "edit clean.py"}),
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "tool_calls": [{"name": "edit_file", "args": {"Path": json.dumps(str(repo / "clean.py"))}}],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            clean_payload = json.dumps(
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "cwd": str(repo),
+                    "transcriptPath": str(clean_edit_transcript),
+                }
+            )
+            clean_proc = run_cli(["--config", str(cfg_path), "--hook-stop"], stdin_text=clean_payload)
+            self.assertEqual(clean_proc.returncode, 0)
+            self.assertEqual(json.loads(clean_proc.stdout), {})
+
+            dirty_edit_transcript = root / "dirty_edit.jsonl"
+            dirty_edit_transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "USER_INPUT", "content": "edit dirty.py"}),
+                        json.dumps(
+                            {
+                                "type": "PLANNER_RESPONSE",
+                                "tool_calls": [{"name": "write_file", "args": {"Path": str(repo / "dirty.py")}}],
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            dirty_payload = json.dumps(
+                {
+                    "terminationReason": "NO_TOOL_CALL",
+                    "cwd": str(repo),
+                    "transcriptPath": str(dirty_edit_transcript),
+                }
+            )
+            dirty_proc = run_cli(["--config", str(cfg_path), "--hook-stop"], stdin_text=dirty_payload)
+            self.assertEqual(dirty_proc.returncode, 0)
+            parsed = json.loads(dirty_proc.stdout)
+            self.assertEqual(parsed.get("decision"), "continue")
+            self.assertIn("dirty.py:2:", parsed.get("reason", ""))
+
+    def test_observe_mode_role_skip_and_malformed_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            self._make_dirty_repo(repo)
+            (repo / ".podo").mkdir()
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+
+            payload = json.dumps({"terminationReason": "NO_TOOL_CALL", "cwd": str(repo)})
+
+            obs_proc = run_cli(
+                ["--config", str(cfg_path), "--hook-stop"],
+                stdin_text=payload,
+                env_overrides={"PODO_GUARD_MODE": "observe"},
+            )
+            self.assertEqual(obs_proc.returncode, 0)
+            self.assertEqual(json.loads(obs_proc.stdout), {})
+            self.assertIn("dirty.py:2:", obs_proc.stderr)
+            observe_log = repo / ".podo" / "last-observe.log"
+            self.assertTrue(observe_log.is_file())
+            self.assertIn("dirty.py:2:", observe_log.read_text(encoding="utf-8"))
+
+            role_proc = run_cli(
+                ["--config", str(cfg_path), "--hook-stop"],
+                stdin_text=payload,
+                env_overrides={"PODO_ROLE": "scout"},
+            )
+            self.assertEqual(role_proc.returncode, 0)
+            self.assertEqual(json.loads(role_proc.stdout), {})
+
+            bad_stdin_proc = run_cli(["--config", str(cfg_path), "--hook-stop"], stdin_text="{not-json")
+            self.assertEqual(bad_stdin_proc.returncode, 0)
+            self.assertEqual(json.loads(bad_stdin_proc.stdout), {})
+
+            (repo / ".podo" / "checks.json").write_text("{corrupt", encoding="utf-8")
+            bad_checks = GUARD.run_codified_checks(repo)
+            self.assertEqual(len(bad_checks), 1)
+            self.assertIn("[STRUCTURAL-CHECK]", bad_checks[0])
+
+    def test_codified_checks_respect_deadline_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".podo").mkdir()
+            checks = {
+                "checks": [
+                    {
+                        "id": "cmd-1",
+                        "type": "required_command",
+                        "command": f"{sys.executable} -c 'import time; time.sleep(0.05)'",
+                        "fix": "optimize",
+                    },
+                    {
+                        "id": "cmd-2",
+                        "type": "required_command",
+                        "command": f"{sys.executable} -c 'import time; time.sleep(0.05)'",
+                        "fix": "optimize",
+                    },
+                ]
+            }
+            (repo / ".podo" / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+            violations = GUARD.run_codified_checks(repo, cmd_timeout=5, deadline=time.monotonic() + 0.05)
+            self.assertTrue(any("deadline budget" in v for v in violations), violations)
+
+
+class ConfigAndDagTests(unittest.TestCase):
+    """Verify modular config commands, offline role-based DAG rendering, and batch node updates."""
+
+    def test_modular_config_reset_preset_alias_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "podo-config.json"
+            fallback = GUARD.load_config(cfg_path)
+            self.assertEqual(fallback["default_roles"]["builder"], "gemini-pro-orchestrator-neon")
+            self.assertEqual(fallback["roles"], fallback["default_roles"])
+            self.assertEqual(fallback["gates"]["stop_hook_mode"], "enforce")
+            self.assertTrue(fallback["gates"]["dead_code_check"])
+            self.assertNotIn("presets", fallback)
+
+            set_proc = run_cli(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "config",
+                    "--set",
+                    "builder=custom-builder-model",
+                    "--mode",
+                    "observe",
+                    "--show",
+                ]
+            )
+            self.assertEqual(set_proc.returncode, 0, set_proc.stderr)
+            updated = json.loads(set_proc.stdout)
+            self.assertEqual(updated["roles"]["builder"], "custom-builder-model")
+            self.assertEqual(updated["gates"]["stop_hook_mode"], "observe")
+
+            reset_proc = run_cli(["--config", str(cfg_path), "config", "--reset", "--show"])
+            self.assertEqual(reset_proc.returncode, 0, reset_proc.stderr)
+            restored = json.loads(reset_proc.stdout)
+            self.assertEqual(restored["roles"]["builder"], "gemini-pro-orchestrator-neon")
+
+            run_cli(["--config", str(cfg_path), "config", "--set", "scout=alt-scout"])
+            alias_proc = run_cli(["--config", str(cfg_path), "config", "--preset", "podo-default", "--show"])
+            self.assertEqual(alias_proc.returncode, 0, alias_proc.stderr)
+            aliased = json.loads(alias_proc.stdout)
+            self.assertEqual(aliased["roles"]["scout"], "gemini-4-hydrogen-medium")
+
+            bad_preset = run_cli(["--config", str(cfg_path), "config", "--preset", "nonexistent"])
+            self.assertEqual(bad_preset.returncode, 2)
+
+    def test_offline_dag_html_role_based_and_batch_set_nodes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            cfg = GUARD.default_config()
+            cfg["roles"]["interrogator"] = "custom-interrogator-v9"
+            GUARD.save_config(cfg, cfg_path)
+
+            phases_json = json.dumps(
+                {
+                    "phases": [
+                        {
+                            "id": "phase-1",
+                            "name": "Phase 1: Core",
+                            "nodes": [
+                                {"id": "t1", "title": "Engine", "worker": "builder-a", "model": "model-a"},
+                                {"id": "t2", "title": "Tests", "worker": "builder-b", "model": "model-b"},
+                            ],
+                        }
+                    ]
+                }
+            )
+            state_path = root / "dag.json"
+            md_path = root / "dag.md"
+            html_path = root / "dag.html"
+
+            init_proc = run_cli(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "dag",
+                    "init",
+                    "--state-file",
+                    str(state_path),
+                    "--title",
+                    "Guard Upgrade",
+                    "--md-out",
+                    str(md_path),
+                    "--html-out",
+                    str(html_path),
+                    "--phases-json",
+                    phases_json,
+                ]
+            )
+            self.assertEqual(init_proc.returncode, 0, init_proc.stderr)
+
+            upd_proc = run_cli(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "dag",
+                    "update",
+                    "--state-file",
+                    str(state_path),
+                    "--phase",
+                    "phase-1",
+                    "--gate-status",
+                    "verified",
+                    "--set-nodes",
+                    "t1=verified,t2=verified",
+                ]
+            )
+            self.assertEqual(upd_proc.returncode, 0, upd_proc.stderr)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            statuses = {n["id"]: n["status"] for n in state["phases"][0]["nodes"]}
+            self.assertEqual(statuses, {"t1": "verified", "t2": "verified"})
+            self.assertEqual(state["phases"][0]["gate_status"], "verified")
+
+            md_text = md_path.read_text(encoding="utf-8")
+            html_text = html_path.read_text(encoding="utf-8")
+
+            self.assertIn("Interrogator Gate", md_text)
+            self.assertIn("custom-interrogator-v9", md_text)
+            self.assertNotIn("claude-opus-5-5-medium", md_text)
+            self.assertNotIn("Opus", md_text)
+
+            self.assertIn("Interrogator Gate", html_text)
+            self.assertIn("custom-interrogator-v9", html_text)
+            self.assertIn("<style>", html_text)
+            self.assertNotIn("<script", html_text)
+            self.assertNotIn("https://", html_text)
+            self.assertNotIn("claude-opus-5-5-medium", html_text)
+            self.assertNotIn("Opus", html_text)
+
+            for token in (
+                "--background",
+                "--card",
+                "--foreground",
+                "--muted-foreground",
+                "--border",
+                "--card-border",
+                "--primary",
+                "--secondary",
+                "--secondary-foreground",
+                "--success",
+                "--warning",
+                "--error",
+            ):
+                self.assertIn(token, html_text)
+
+            bad_upd = run_cli(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "dag",
+                    "update",
+                    "--state-file",
+                    str(state_path),
+                    "--set-nodes",
+                    "missing-node=verified",
+                ]
+            )
+            self.assertEqual(bad_upd.returncode, 2)
+
+    def test_cli_parser_has_no_removed_post_tool_hook(self) -> None:
+        parser = GUARD.build_parser()
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        with redirect_stdout(buf_out), redirect_stderr(buf_err):
+            ns = parser.parse_args([])
+        self.assertEqual(set(vars(ns).keys()), {"config", "hook_stop", "command"})
+
+
+if __name__ == "__main__":
+    unittest.main()

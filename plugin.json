@@ -1,15 +1,18 @@
 {
   "name": "podo-stuff",
   "displayName": "Podo Stuff",
-  "description": "Deterministic structural guardrails, comment gates, and phased parallel DAG swarm orchestration for Antigravity.",
+  "description": "Deterministic code guardrails, dead-code checks, and phased parallel swarm workflows for Antigravity.",
   "version": "1.0.0",
-  "author": "popododo",
+  "author": {
+    "name": "popododo",
+    "url": "https://github.com/popododo0720"
+  },
   "homepage": "https://github.com/popododo0720/podo-stuff",
   "repository": "https://github.com/popododo0720/podo-stuff",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "/podo-setup Show live quotas and inspect my podo-stuff role routing",
-    "/podo-swarm Implement this feature with max-parallel DAG phases and per-phase Opus interrogation",
-    "/podo-swarm arena: Solve this tricky concurrency bug by competing Orchestrator Neon vs Claude Opus 5.5"
+    "/podo-setup Inspect live model quotas and configure my role routing",
+    "/podo-swarm Plan and build this feature in parallel DAG phases with per-phase batch verification",
+    "/podo-swarm arena: Compare two independent implementations for this bug and select the strongest fix"
   ]
 }

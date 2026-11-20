@@ -1,5 +1,12 @@
 {
-  "active_preset": "podo-default",
+  "default_roles": {
+    "scout": "gemini-4-hydrogen-medium",
+    "builder": "gemini-pro-orchestrator-neon",
+    "arena_a": "gemini-pro-orchestrator-neon",
+    "arena_b": "claude-opus-5-5-medium",
+    "interrogator": "claude-opus-5-5-medium",
+    "monitor": "gemini-4-hydrogen-low"
+  },
   "roles": {
     "scout": "gemini-4-hydrogen-medium",
     "builder": "gemini-pro-orchestrator-neon",
@@ -8,21 +15,10 @@
     "interrogator": "claude-opus-5-5-medium",
     "monitor": "gemini-4-hydrogen-low"
   },
-  "presets": {
-    "podo-default": {
-      "description": "Default popododo stack: Hydrogen Medium scouts, Orchestrator Neon builders, Neon vs Opus Medium arena, Opus Medium per-phase interrogator, Hydrogen Low monitor.",
-      "roles": {
-        "scout": "gemini-4-hydrogen-medium",
-        "builder": "gemini-pro-orchestrator-neon",
-        "arena_a": "gemini-pro-orchestrator-neon",
-        "arena_b": "claude-opus-5-5-medium",
-        "interrogator": "claude-opus-5-5-medium",
-        "monitor": "gemini-4-hydrogen-low"
-      }
-    }
-  },
   "gates": {
+    "stop_hook_mode": "enforce",
     "per_task_deterministic_script": true,
+    "dead_code_check": true,
     "interrogator_cadence": "per_dag_phase",
     "allow_comment_tags": [
       "WHY:",
