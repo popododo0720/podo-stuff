@@ -1563,10 +1563,11 @@ class AutopilotRouterTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(m.call_count, 1)
             sys_msg = out["injectSteps"][0]["systemMessage"]
+            self.assertNotIn("metadata", sys_msg)
             self.assertIn("podo-swarm", sys_msg["systemMessage"])
             self.assertIn("needs_arena=true", sys_msg["systemMessage"])
-            self.assertIn("Podo Autopilot · Swarm", sys_msg["metadata"]["user_markdown"])
-            self.assertIn("Arena 권장", sys_msg["metadata"]["user_markdown"])
+            self.assertIn("Podo Autopilot · Swarm", sys_msg["systemMessage"])
+            self.assertIn("Arena 권장", sys_msg["systemMessage"])
             tel_path = artifact_dir / "podo-telemetry.jsonl"
             self.assertTrue(tel_path.is_file())
             self.assertIn("autopilot-router", tel_path.read_text(encoding="utf-8"))
@@ -1584,7 +1585,8 @@ class AutopilotRouterTests(unittest.TestCase):
                 mock_response=grill_resp,
             )
             self.assertEqual(rc_g, 0)
-            self.assertIn("Podo Autopilot · Grill", out_g["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("metadata", out_g["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Grill", out_g["injectSteps"][0]["systemMessage"]["systemMessage"])
 
             plan_resp = {
                 "answers": {
@@ -1599,7 +1601,8 @@ class AutopilotRouterTests(unittest.TestCase):
                 mock_response=plan_resp,
             )
             self.assertEqual(rc_p, 0)
-            self.assertIn("Podo Autopilot · Plan", out_p["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("metadata", out_p["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Plan", out_p["injectSteps"][0]["systemMessage"]["systemMessage"])
 
             direct_resp = {
                 "answers": {
@@ -1696,7 +1699,8 @@ class AutopilotRouterTests(unittest.TestCase):
             rc1, out1, m1 = self._run_pre_invocation(payload_turn1, cfg_path, env_overrides=env, mock_response=plan_resp)
             self.assertEqual(rc1, 0)
             self.assertEqual(m1.call_count, 1)
-            self.assertIn("Podo Autopilot · Plan", out1["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("metadata", out1["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Plan", out1["injectSteps"][0]["systemMessage"]["systemMessage"])
 
             rc_dup, out_dup, m_dup = self._run_pre_invocation(
                 payload_turn1,
@@ -1808,7 +1812,8 @@ class AutopilotRouterTests(unittest.TestCase):
                 mock_response=ambig_resp,
             )
             self.assertEqual(rc_amb, 0)
-            self.assertIn("Podo Autopilot · Clarify", out_amb["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("metadata", out_amb["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Clarify", out_amb["injectSteps"][0]["systemMessage"]["systemMessage"])
             self.assertIn("Do NOT spawn swarm workers", out_amb["injectSteps"][0]["systemMessage"]["systemMessage"])
 
             boundary_resp = {
@@ -1830,8 +1835,9 @@ class AutopilotRouterTests(unittest.TestCase):
                 mock_response=boundary_resp,
             )
             self.assertEqual(rc_bnd, 0)
-            self.assertIn("Podo Autopilot · Plan", out_bnd["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
-            self.assertIn("Goldfish 설계 검증", out_bnd["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("metadata", out_bnd["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Plan", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertIn("Goldfish 설계 검증", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
             self.assertIn("swarm/plan boundary", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
             self.assertIn("egm-design", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
 
@@ -1850,8 +1856,9 @@ class AutopilotRouterTests(unittest.TestCase):
                 mock_response=simple_plan_resp,
             )
             self.assertEqual(rc_sp, 0)
+            self.assertNotIn("metadata", out_sp["injectSteps"][0]["systemMessage"])
             self.assertNotIn("egm-design", out_sp["injectSteps"][0]["systemMessage"]["systemMessage"])
-            self.assertNotIn("Goldfish", out_sp["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertNotIn("Goldfish", out_sp["injectSteps"][0]["systemMessage"]["systemMessage"])
 
 
 if __name__ == "__main__":

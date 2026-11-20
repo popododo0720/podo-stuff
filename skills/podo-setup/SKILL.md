@@ -42,7 +42,7 @@ Manage `podo-config.json` dynamically using live Antigravity model quotas. Alway
 - `autopilot.model`: Decisions model ID (`gemini-decision-1` by default).
 - `autopilot.confidence_threshold`: Minimum confidence (`0.65`) required before injecting `swarm`, `plan`, or `grill` mode (`direct` passes through silently).
 - `autopilot.arena_threshold`: Minimum `needs_arena` probability (`0.70`) to recommend dual-model Arena competition during auto-swarm.
-- `autopilot.show_banner`: Display a concise one-line inline markdown banner (`metadata.user_markdown`) when auto-routing activates.
+- `autopilot.show_banner`: Instruct the assistant to display a concise one-line status banner at the top of its reply when auto-routing activates.
 - Credentials resolve automatically from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `~/.config/gemini-api/config.yaml` (fails open silently if unset).
 
 ## Procedure

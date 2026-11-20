@@ -361,6 +361,16 @@ def call_decisions_api(
     return parse_decisions_response(parsed)
 
 
+def wrap_autopilot_system_message(directive: str, banner: str, show_banner: bool) -> dict[str, Any]:
+    """Build a PreInvocation injectSteps payload without metadata fields that break protojson parsing."""
+    final_directive = (
+        f'{directive} Start your response with this exact one-line banner on line 1, followed by a blank line: "{banner}"'
+        if show_banner and banner
+        else directive
+    )
+    return {"injectSteps": [{"systemMessage": {"systemMessage": final_directive}}]}
+
+
 def evaluate_autopilot_decision_detailed(
     decision: dict[str, Any],
     autopilot_cfg: dict[str, Any],
@@ -406,10 +416,7 @@ def evaluate_autopilot_decision_detailed(
             f"(complexity={float(complexity_score):.2f}, needs_clarification={float(clarification_prob):.2f}). "
             "Do NOT spawn swarm workers or edit code yet; ask 1-3 concise clarifying questions to lock down scope, target modules, and constraints first."
         )
-        sys_msg: dict[str, Any] = {"systemMessage": directive}
-        if show_banner:
-            sys_msg["metadata"] = {"user_markdown": banner}
-        return "clarify", "high_ambiguity_clarify", {"injectSteps": [{"systemMessage": sys_msg}]}
+        return "clarify", "high_ambiguity_clarify", wrap_autopilot_system_message(directive, banner, show_banner)
 
     if mode != "direct" and confidence >= threshold:
         conf_pct = f"{confidence:.0%}"
@@ -446,10 +453,7 @@ def evaluate_autopilot_decision_detailed(
             )
             effective_mode = "plan"
 
-        sys_msg = {"systemMessage": directive}
-        if show_banner:
-            sys_msg["metadata"] = {"user_markdown": banner}
-        return effective_mode, "confident_mode", {"injectSteps": [{"systemMessage": sys_msg}]}
+        return effective_mode, "confident_mode", wrap_autopilot_system_message(directive, banner, show_banner)
 
     swarm_plan_mass = float(probs.get("swarm") or 0.0) + float(probs.get("plan") or 0.0)
     if is_complex and swarm_plan_mass >= boundary_plan_threshold:
@@ -464,10 +468,7 @@ def evaluate_autopilot_decision_detailed(
             "Present a concise architecture and step-by-step execution plan first so the user can approve before spawning parallel workers."
             + egm_directive
         )
-        sys_msg = {"systemMessage": directive}
-        if show_banner:
-            sys_msg["metadata"] = {"user_markdown": banner}
-        return "plan", "complex_boundary_plan", {"injectSteps": [{"systemMessage": sys_msg}]}
+        return "plan", "complex_boundary_plan", wrap_autopilot_system_message(directive, banner, show_banner)
 
     return "direct", "direct_default", {}
 
