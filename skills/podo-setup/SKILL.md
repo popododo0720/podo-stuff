@@ -34,6 +34,17 @@ Manage `podo-config.json` dynamically using live Antigravity model quotas. Alway
   - `gate_fail_rate_warn`: Triggers `HIGH_GATE_FAIL_RATE` when the deterministic gate failure rate meets or exceeds this threshold.
   - `interrogator_history_multiplier_warn`: Triggers `INTERROGATOR_SPIKE_VS_HISTORY` when current session `interrogator_calls` meets or exceeds `multiplier * historical_avg` across prior `.podo/snapshots/*.json`.
 
+## Autopilot Router (`PreInvocation` + `gemini-decision-1`)
+
+`podo-config.json` includes `"autopilot"` settings for automatic intent routing via the Gemini Decisions API (`gemini-decision-1`, 0 output tokens):
+
+- `autopilot.enabled`: Toggle the `PreInvocation` router (`true` / `false`, or `PODO_AUTOPILOT=off` per session).
+- `autopilot.model`: Decisions model ID (`gemini-decision-1` by default).
+- `autopilot.confidence_threshold`: Minimum confidence (`0.65`) required before injecting `swarm`, `plan`, or `grill` mode (`direct` passes through silently).
+- `autopilot.arena_threshold`: Minimum `needs_arena` probability (`0.70`) to recommend dual-model Arena competition during auto-swarm.
+- `autopilot.show_banner`: Display a concise one-line inline markdown banner (`metadata.user_markdown`) when auto-routing activates.
+- Credentials resolve automatically from `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or `~/.config/gemini-api/config.yaml` (fails open silently if unset).
+
 ## Procedure
 
 1. **Fetch Live Quotas**:
@@ -56,6 +67,10 @@ Manage `podo-config.json` dynamically using live Antigravity model quotas. Alway
    - Toggle the `Stop` hook mode (`enforce` blocks stop on violations, `observe` logs warnings without blocking, `off` disables the Stop hook):
      ```bash
      python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --mode enforce|observe|off
+     ```
+   - Toggle the `PreInvocation` Autopilot Router (`on` or `off`):
+     ```bash
+     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --autopilot on|off
      ```
    - Tune `telemetry.role_avg_tokens` or `telemetry.anomaly_thresholds` directly in `podo-config.json` when calibrating baselines to a project's typical task size or stricter/looser churn alerts.
    - Re-run `config --show` and confirm the updated configuration cleanly.

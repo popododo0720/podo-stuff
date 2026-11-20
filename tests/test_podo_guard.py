@@ -12,9 +12,11 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 GUARD_SCRIPT = PLUGIN_ROOT / "scripts" / "podo-guard.py"
@@ -706,7 +708,7 @@ class ConfigAndDagTests(unittest.TestCase):
         buf_err = io.StringIO()
         with redirect_stdout(buf_out), redirect_stderr(buf_err):
             ns = parser.parse_args([])
-        self.assertEqual(set(vars(ns).keys()), {"config", "hook_stop", "command"})
+        self.assertEqual(set(vars(ns).keys()), {"config", "hook_stop", "hook_pre_invocation", "command"})
 
 
 class ObservabilityTests(unittest.TestCase):
@@ -1437,6 +1439,220 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn("width: 100.0%", html_text)
             self.assertNotIn("(@builder-1)", html_text)
             self.assertNotIn("https://", html_text)
+
+
+class AutopilotRouterTests(unittest.TestCase):
+    """Verify PreInvocation Gemini Decisions API autopilot routing, gating, and fail-open behavior."""
+
+    def _run_pre_invocation(
+        self,
+        payload: dict[str, Any],
+        cfg_path: Path,
+        env_overrides: dict[str, str] | None = None,
+        mock_response: dict[str, Any] | Exception | None = None,
+    ) -> tuple[int, dict[str, Any], mock.MagicMock]:
+        buf = io.StringIO()
+        raw_stdin = json.dumps(payload)
+
+        class DummyResp:
+            def __init__(self, body: dict[str, Any]) -> None:
+                self._raw = json.dumps(body).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._raw
+
+            def __enter__(self) -> DummyResp:
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        def fake_urlopen(req: Any, timeout: float = 5.0) -> Any:
+            if isinstance(mock_response, Exception):
+                raise mock_response
+            return DummyResp(mock_response or {})
+
+        env_patch = dict(env_overrides or {})
+        with (
+            mock.patch.dict(os.environ, env_patch, clear=False),
+            mock.patch.object(sys, "stdin", io.StringIO(raw_stdin)),
+            mock.patch.object(GUARD.urllib.request, "urlopen", side_effect=fake_urlopen) as urlopen_mock,
+            redirect_stdout(buf),
+        ):
+            rc = GUARD.handle_hook_pre_invocation(config_path=cfg_path)
+        parsed = json.loads(buf.getvalue().strip() or "{}")
+        return rc, parsed, urlopen_mock
+
+    def test_skips_subsequent_invocations_slash_commands_worker_roles_and_disabled_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            env = {"GEMINI_API_KEY": "test-key", "PODO_ROLE": "", "PODO_AUTOPILOT": ""}
+
+            rc1, out1, m1 = self._run_pre_invocation(
+                {"invocationNum": 2, "lastUserInput": "Refactor the auth module"},
+                cfg_path,
+                env_overrides=env,
+            )
+            self.assertEqual(rc1, 0)
+            self.assertEqual(out1, {})
+            self.assertEqual(m1.call_count, 0)
+
+            rc2, out2, m2 = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "/podo-swarm build feature"},
+                cfg_path,
+                env_overrides=env,
+            )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(out2, {})
+            self.assertEqual(m2.call_count, 0)
+
+            rc3, out3, m3 = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "Implement entire billing service"},
+                cfg_path,
+                env_overrides={"GEMINI_API_KEY": "test-key", "PODO_ROLE": "builder", "PODO_AUTOPILOT": ""},
+            )
+            self.assertEqual(rc3, 0)
+            self.assertEqual(out3, {})
+            self.assertEqual(m3.call_count, 0)
+
+            off_proc = run_cli(["--config", str(cfg_path), "config", "--autopilot", "off", "--show"])
+            self.assertEqual(off_proc.returncode, 0, off_proc.stderr)
+            self.assertFalse(json.loads(off_proc.stdout)["autopilot"]["enabled"])
+
+            rc4, out4, m4 = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "Implement entire billing service"},
+                cfg_path,
+                env_overrides=env,
+            )
+            self.assertEqual(rc4, 0)
+            self.assertEqual(out4, {})
+            self.assertEqual(m4.call_count, 0)
+
+    def test_routes_swarm_grill_plan_direct_and_arena_with_inline_banner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            env = {"GEMINI_API_KEY": "test-key", "PODO_ROLE": "", "PODO_AUTOPILOT": ""}
+
+            swarm_resp = {
+                "answers": {
+                    "mode": {
+                        "winningOption": "swarm",
+                        "confidence": 0.91,
+                        "probabilities": {"swarm": 0.91, "direct": 0.05, "plan": 0.02, "grill": 0.02},
+                    },
+                    "needs_arena": {"noul": 0.82, "confidence": 0.85},
+                }
+            }
+            rc, out, m = self._run_pre_invocation(
+                {
+                    "invocationNum": 1,
+                    "lastUserInput": "JWT 캐싱 처리 전체 파일에 싹 다 적용해",
+                    "artifactDirectoryPath": str(artifact_dir),
+                    "conversationId": "conv-auto-1",
+                },
+                cfg_path,
+                env_overrides=env,
+                mock_response=swarm_resp,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual(m.call_count, 1)
+            sys_msg = out["injectSteps"][0]["systemMessage"]
+            self.assertIn("podo-swarm", sys_msg["systemMessage"])
+            self.assertIn("needs_arena=true", sys_msg["systemMessage"])
+            self.assertIn("Podo Autopilot · Swarm", sys_msg["metadata"]["user_markdown"])
+            self.assertIn("Arena 권장", sys_msg["metadata"]["user_markdown"])
+            tel_path = artifact_dir / "podo-telemetry.jsonl"
+            self.assertTrue(tel_path.is_file())
+            self.assertIn("autopilot-router", tel_path.read_text(encoding="utf-8"))
+
+            grill_resp = {
+                "answers": {
+                    "mode": {"winning_option": "grill", "confidence": 0.88},
+                    "needs_arena": {"noul": 0.1},
+                }
+            }
+            rc_g, out_g, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "인증 로직 보안 구멍 털어봐"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=grill_resp,
+            )
+            self.assertEqual(rc_g, 0)
+            self.assertIn("Podo Autopilot · Grill", out_g["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+
+            plan_resp = {
+                "answers": {
+                    "mode": {"winning_option": "plan", "confidence": 0.79},
+                    "needs_arena": {"noul": 0.2},
+                }
+            }
+            rc_p, out_p, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "캐시 아키텍처부터 설계해보자"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=plan_resp,
+            )
+            self.assertEqual(rc_p, 0)
+            self.assertIn("Podo Autopilot · Plan", out_p["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+
+            direct_resp = {
+                "answers": {
+                    "mode": {"winning_option": "direct", "confidence": 0.95},
+                    "needs_arena": {"noul": 0.05},
+                }
+            }
+            rc_d, out_d, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "JWT 만료 기간 보통 얼마야?"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=direct_resp,
+            )
+            self.assertEqual(rc_d, 0)
+            self.assertEqual(out_d, {})
+
+            low_conf_resp = {
+                "answers": {
+                    "mode": {"winning_option": "swarm", "confidence": 0.42},
+                    "needs_arena": {"noul": 0.1},
+                }
+            }
+            rc_l, out_l, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "이거 좀 봐줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=low_conf_resp,
+            )
+            self.assertEqual(rc_l, 0)
+            self.assertEqual(out_l, {})
+
+    def test_fails_open_on_http_error_and_reads_gemini_api_config_yaml(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            env = {"GEMINI_API_KEY": "test-key", "PODO_ROLE": "", "PODO_AUTOPILOT": ""}
+
+            rc_err, out_err, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "전체 리팩토링해줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=urllib.error.URLError("network down"),
+            )
+            self.assertEqual(rc_err, 0)
+            self.assertEqual(out_err, {})
+
+            fake_home = root / "home"
+            yaml_dir = fake_home / ".config" / "gemini-api"
+            yaml_dir.mkdir(parents=True)
+            (yaml_dir / "config.yaml").write_text('api_key: "yaml-secret-key"\n', encoding="utf-8")
+            with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}, clear=False):
+                self.assertEqual(GUARD.resolve_gemini_api_key(home_dir=fake_home), "yaml-secret-key")
 
 
 if __name__ == "__main__":

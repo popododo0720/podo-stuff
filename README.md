@@ -100,6 +100,7 @@ python3 scripts/podo-guard.py config --show
 python3 scripts/podo-guard.py config --set builder=<model_id>
 python3 scripts/podo-guard.py config --reset
 python3 scripts/podo-guard.py config --mode observe
+python3 scripts/podo-guard.py config --autopilot on
 python3 scripts/podo-guard.py check --repo . --base main --phase phase-1 --worker builder-1 --role builder --run-verify
 python3 scripts/podo-guard.py check --repo . --files src/app.py,src/util.py --mode observe
 python3 scripts/podo-guard.py codify --repo . --id no-raw-sql --glob "*.py" --regex "execute\(f['\"]" --fix "Use parameterized queries"

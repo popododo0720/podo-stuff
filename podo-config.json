@@ -42,5 +42,14 @@
       "gate_fail_rate_warn": 0.35,
       "interrogator_history_multiplier_warn": 2.0
     }
+  },
+  "autopilot": {
+    "enabled": true,
+    "model": "gemini-decision-1",
+    "api_base_url": "https://generativelanguage.googleapis.com/v1beta/decisions",
+    "confidence_threshold": 0.65,
+    "arena_threshold": 0.7,
+    "show_banner": true,
+    "timeout_s": 5
   }
 }

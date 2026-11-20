@@ -1,4 +1,13 @@
 {
+  "podo-autopilot-router": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/podo-guard.py --hook-pre-invocation",
+        "timeout": 8
+      }
+    ]
+  },
   "podo-deterministic-gate": {
     "Stop": [
       {
