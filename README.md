@@ -44,7 +44,8 @@ Installs the plugin globally into `~/.gemini/config/plugins/podo-stuff/`.
 
 ```bash
 python3 scripts/podo-guard.py config --show
-python3 scripts/podo-guard.py config --preset quota-saver-argon
+python3 scripts/podo-guard.py config --set builder=<model_id>
+python3 scripts/podo-guard.py config --preset podo-default
 python3 scripts/podo-guard.py check --repo . --run-verify
 python3 scripts/podo-guard.py codify --repo . --id no-raw-sql --glob "*.py" --regex "execute\(f['\"]" --fix "Use parameterized queries"
 python3 scripts/podo-guard.py codify --repo . --id tla-check --cmd "tlc specs/StateMachine.tla" --fix "Fix TLA+ invariant violation"

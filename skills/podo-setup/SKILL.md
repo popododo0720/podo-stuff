@@ -30,15 +30,15 @@ Manage `podo-config.json` role-to-model routing based on real-time Antigravity q
    - Run `python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --show` (or `./scripts/podo-guard.py` if run from inside the plugin repository).
 3. **Present Table**:
    - Show the user a concise markdown table mapping each role (`scout`, `builder`, `arena_a`, `arena_b`, `interrogator`, `monitor`) to its configured model and live `quota_remaining`.
-   - Also list available presets (`podo-default`, `quota-saver-argon`, `all-google`).
+   - Note that the default preset is `podo-default` and any individual role can be overridden ad hoc when desired.
 4. **Apply Changes (When Requested)**:
-   - Preset switch:
-     ```bash
-     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --preset <preset_name>
-     ```
-   - Individual role override:
+   - Individual role override (ad hoc):
      ```bash
      python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --set <role>=<model_id>
+     ```
+   - Reset to default preset (`podo-default`):
+     ```bash
+     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --preset podo-default
      ```
    - Verify any user-specified model ID exists in the `swarm{action: "models", all: true}` output before saving.
    - Re-run `config --show` and confirm the updated mapping cleanly.

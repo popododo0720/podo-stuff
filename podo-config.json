@@ -19,28 +19,6 @@
         "interrogator": "claude-opus-5-5-medium",
         "monitor": "gemini-4-hydrogen-low"
       }
-    },
-    "quota-saver-argon": {
-      "description": "Preserve Neon quota by shifting builders and arena_a to Orchestrator Argon while keeping Opus 5.5 Medium interrogation.",
-      "roles": {
-        "scout": "gemini-4-hydrogen-medium",
-        "builder": "gemini-pro-orchestrator-g1-pro",
-        "arena_a": "gemini-pro-orchestrator-g1-pro",
-        "arena_b": "claude-opus-5-5-medium",
-        "interrogator": "claude-opus-5-5-medium",
-        "monitor": "gemini-4-hydrogen-low"
-      }
-    },
-    "all-google": {
-      "description": "100% Google Gemini 4 pool using Argon High as cross-pool challenger and interrogator.",
-      "roles": {
-        "scout": "gemini-4-hydrogen-medium",
-        "builder": "gemini-pro-orchestrator-neon",
-        "arena_a": "gemini-pro-orchestrator-neon",
-        "arena_b": "gemini-4-argon-high",
-        "interrogator": "gemini-4-argon-high",
-        "monitor": "gemini-4-hydrogen-low"
-      }
     }
   },
   "gates": {
