@@ -16,13 +16,44 @@ import sys
 import textwrap
 import time
 import tokenize
-import urllib.error
-import urllib.request
+import urllib.request  # noqa: F401
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from podo.autopilot import (
+    AUTOPILOT_DECISION_QUESTIONS,
+    AUTOPILOT_SKIP_ROLES,
+    DEFAULT_AUTOPILOT_CONFIG,
+    build_autopilot_injection,
+    call_decisions_api,
+    evaluate_autopilot_decision,
+    extract_recent_transcript_context,
+    get_autopilot_config,
+    handle_hook_pre_invocation,
+    parse_decisions_response,
+    resolve_gemini_api_key,
+)
+
+__all__ = [
+    "AUTOPILOT_DECISION_QUESTIONS",
+    "AUTOPILOT_SKIP_ROLES",
+    "DEFAULT_AUTOPILOT_CONFIG",
+    "build_autopilot_injection",
+    "call_decisions_api",
+    "evaluate_autopilot_decision",
+    "extract_recent_transcript_context",
+    "get_autopilot_config",
+    "handle_hook_pre_invocation",
+    "parse_decisions_response",
+    "resolve_gemini_api_key",
+]
+
+PLUGIN_ROOT = SCRIPTS_DIR.parent
 DEFAULT_CONFIG_PATH = PLUGIN_ROOT / "podo-config.json"
 
 DEFAULT_ALLOW_TAGS = ("WHY:", "INVARIANT:", "SAFETY:", "NOTE(popododo):")
@@ -180,40 +211,10 @@ DEFAULT_TELEMETRY_ANOMALY_THRESHOLDS: dict[str, float] = {
     "interrogator_history_multiplier_warn": 2.0,
 }
 
-DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
-    "enabled": True,
-    "model": "gemini-decision-1",
-    "api_base_url": "https://generativelanguage.googleapis.com/v1beta/decisions",
-    "confidence_threshold": 0.65,
-    "arena_threshold": 0.70,
-    "show_banner": True,
-    "timeout_s": 5,
-}
-
-AUTOPILOT_SKIP_ROLES = {"builder", "scout", "interrogator", "monitor", "arena_a", "arena_b"}
-
-AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
-    "mode": {
-        "type": "choice",
-        "instructions": "Select the best execution strategy for the current user request.",
-        "criteria": {
-            "direct": "Normal conversation, conceptual question, explanation, quick lookup, or small single-file edit.",
-            "swarm": "Multi-file implementation, new feature build, broad refactoring, or autonomous end-to-end coding task that benefits from parallel podo-swarm execution.",
-            "plan": "Architecture design, system trade-off analysis, or step-by-step planning requested before writing code.",
-            "grill": "Adversarial code review, security or bug audit, or critical evaluation challenging flaws in code or design.",
-        },
-    },
-    "needs_arena": {
-        "type": "noul",
-        "instructions": "Is this task high-risk or architecture-critical enough to warrant dual-model Arena competition?",
-    },
-}
-
 ACTIVE_DAG_STATUSES = {"building", "arena_running", "script_checked", "phase_interrogating"}
 TERMINAL_DAG_STATUSES = {"verified", "rejected"}
 INTERROGATOR_CALL_STATUSES = {"phase_interrogating", "rejected", "verified"}
 VIOLATION_FILE_RE = re.compile(r"^\[[^\]]+\]\s+([^\s:]+):\d+")
-API_KEY_YAML_RE = re.compile(r"^\s*api_key\s*:\s*['\"]?([^'\"#\s]+)['\"]?\s*$")
 
 
 def default_config() -> dict[str, Any]:
@@ -3865,313 +3866,6 @@ def handle_hook_stop(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         return 0
 
     print("{}")
-    return 0
-
-
-def get_autopilot_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Return autopilot router settings merged with defaults."""
-    merged = dict(DEFAULT_AUTOPILOT_CONFIG)
-    raw = cfg.get("autopilot")
-    if isinstance(raw, dict):
-        if "enabled" in raw:
-            merged["enabled"] = bool(raw["enabled"])
-        if isinstance(raw.get("model"), str) and raw["model"].strip():
-            merged["model"] = raw["model"].strip()
-        if isinstance(raw.get("api_base_url"), str) and raw["api_base_url"].strip():
-            merged["api_base_url"] = raw["api_base_url"].strip()
-        if isinstance(raw.get("confidence_threshold"), (int, float)):
-            merged["confidence_threshold"] = max(0.0, min(1.0, float(raw["confidence_threshold"])))
-        if isinstance(raw.get("arena_threshold"), (int, float)):
-            merged["arena_threshold"] = max(0.0, min(1.0, float(raw["arena_threshold"])))
-        if "show_banner" in raw:
-            merged["show_banner"] = bool(raw["show_banner"])
-        if isinstance(raw.get("timeout_s"), (int, float)) and raw["timeout_s"] > 0:
-            merged["timeout_s"] = float(raw["timeout_s"])
-    return merged
-
-
-def resolve_gemini_api_key(home_dir: Path | None = None) -> str:
-    """Resolve Gemini API key from environment variables or headless gemini-api config.yaml."""
-    for env_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        val = os.environ.get(env_name, "").strip()
-        if val:
-            return val
-    base_home = home_dir if home_dir is not None else Path.home()
-    yaml_path = base_home / ".config" / "gemini-api" / "config.yaml"
-    if yaml_path.is_file():
-        try:
-            for line in yaml_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                match = API_KEY_YAML_RE.match(line)
-                if match:
-                    key = match.group(1).strip()
-                    if key:
-                        return key
-        except OSError:
-            return ""
-    return ""
-
-
-def extract_recent_transcript_context(
-    transcript_path: Path | None,
-    max_turns: int = 2,
-    max_chars: int = 1200,
-) -> str:
-    """Extract the most recent user and assistant text snippets from transcript.jsonl."""
-    if transcript_path is None or not transcript_path.is_file():
-        return ""
-    snippets: list[str] = []
-    try:
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    for line in lines[-40:]:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        step_type = str(entry.get("type") or "")
-        content = entry.get("content")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        if step_type == "USER_INPUT":
-            snippets.append(f"User: {content.strip()[:300]}")
-        elif step_type == "PLANNER_RESPONSE":
-            snippets.append(f"Assistant: {content.strip()[:300]}")
-    if not snippets:
-        return ""
-    selected = snippets[-(max_turns * 2) :]
-    joined = "\n".join(selected)
-    return joined[-max_chars:]
-
-
-def parse_decisions_response(data: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract normalized mode, confidence, probabilities, and arena score from Decisions API JSON."""
-    answers = data.get("answers")
-    if not isinstance(answers, dict):
-        return None
-    mode_ans = answers.get("mode")
-    if not isinstance(mode_ans, dict):
-        return None
-    winning = mode_ans.get("winning_option") or mode_ans.get("winningOption") or ""
-    if not isinstance(winning, str) or not winning.strip():
-        probs_raw = mode_ans.get("probabilities")
-        if isinstance(probs_raw, dict) and probs_raw:
-            winning = str(max(probs_raw.items(), key=lambda kv: float(kv[1] or 0.0))[0])
-    mode = str(winning).strip().lower()
-    if mode not in {"direct", "swarm", "plan", "grill"}:
-        return None
-    confidence_raw = mode_ans.get("confidence")
-    confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.0
-    probs_raw = mode_ans.get("probabilities")
-    probabilities: dict[str, float] = {}
-    if isinstance(probs_raw, dict):
-        for k, v in probs_raw.items():
-            if isinstance(v, (int, float)):
-                probabilities[str(k)] = round(float(v), 4)
-    if confidence <= 0.0 and mode in probabilities:
-        confidence = probabilities[mode]
-
-    arena_prob = 0.0
-    arena_ans = answers.get("needs_arena")
-    if isinstance(arena_ans, dict):
-        noul_val = arena_ans.get("noul")
-        if isinstance(noul_val, (int, float)):
-            arena_prob = float(noul_val)
-
-    return {
-        "mode": mode,
-        "confidence": round(confidence, 4),
-        "probabilities": probabilities,
-        "needs_arena_prob": round(arena_prob, 4),
-    }
-
-
-def call_decisions_api(
-    prompt_text: str,
-    api_key: str,
-    autopilot_cfg: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Call Gemini Decisions API (gemini-decision-1) with 0 output tokens and fail-open error handling."""
-    url = str(autopilot_cfg.get("api_base_url") or DEFAULT_AUTOPILOT_CONFIG["api_base_url"])
-    model = str(autopilot_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"])
-    timeout_s = float(autopilot_cfg.get("timeout_s") or DEFAULT_AUTOPILOT_CONFIG["timeout_s"])
-    body = json.dumps(
-        {
-            "model": model,
-            "input": prompt_text,
-            "questions": AUTOPILOT_DECISION_QUESTIONS,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "x-goog-api-key": api_key,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
-        parsed = json.loads(raw)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    return parse_decisions_response(parsed)
-
-
-def build_autopilot_injection(
-    decision: dict[str, Any],
-    autopilot_cfg: dict[str, Any],
-    plugin_root: Path = PLUGIN_ROOT,
-) -> dict[str, Any]:
-    """Translate a Decisions API classification into an Antigravity PreInvocation injectSteps payload."""
-    mode = str(decision.get("mode") or "direct")
-    confidence = float(decision.get("confidence") or 0.0)
-    threshold = float(autopilot_cfg.get("confidence_threshold", 0.65))
-    arena_threshold = float(autopilot_cfg.get("arena_threshold", 0.70))
-    needs_arena = float(decision.get("needs_arena_prob") or 0.0) >= arena_threshold
-    show_banner = bool(autopilot_cfg.get("show_banner", True))
-
-    if mode == "direct" or confidence < threshold:
-        return {}
-
-    conf_pct = f"{confidence:.0%}"
-    if mode == "swarm":
-        arena_note = " · Arena 권장" if needs_arena else ""
-        arena_directive = (
-            " The decision model also flagged high architectural risk (`needs_arena=true`), so consider dual-model Arena competition for the core module."
-            if needs_arena
-            else ""
-        )
-        swarm_skill_path = plugin_root / "skills" / "podo-swarm" / "SKILL.md"
-        banner = f"🐝 **[Podo Autopilot · Swarm]** 대규모 구현 작업으로 판단되어 `podo-swarm` 파이프라인으로 자동 실행합니다. *(신뢰도 {conf_pct}{arena_note})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as SWARM (confidence={conf_pct}). "
-            f"Do NOT ask the user to type /podo-swarm; immediately read {swarm_skill_path} and execute the phased parallel podo-swarm workflow using the configured role models in podo-config.json."
-            + arena_directive
-        )
-    elif mode == "grill":
-        banner = f"🔥 **[Podo Autopilot · Grill]** 엄격한 코드·설계 검증 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as GRILL (confidence={conf_pct}). "
-            "Act as an adversarial senior reviewer: scrutinize security holes, race conditions, hidden assumptions, edge cases, and architectural flaws before proposing fixes."
-        )
-    else:
-        banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as PLAN (confidence={conf_pct}). "
-            "Present a concise architecture design, key trade-offs, and a concrete step-by-step execution plan before making code edits."
-        )
-
-    sys_msg: dict[str, Any] = {"systemMessage": directive}
-    if show_banner:
-        sys_msg["metadata"] = {"user_markdown": banner}
-    return {"injectSteps": [{"systemMessage": sys_msg}]}
-
-
-def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
-    """Route user requests automatically via Gemini Decisions API before the main model runs."""
-    t0 = time.monotonic()
-    env_toggle = os.environ.get("PODO_AUTOPILOT", "").strip().lower()
-    if env_toggle in {"off", "false", "0"}:
-        print("{}")
-        return 0
-    role = os.environ.get("PODO_ROLE", "").strip().lower()
-    if role in AUTOPILOT_SKIP_ROLES:
-        print("{}")
-        return 0
-
-    raw = sys.stdin.read().strip()
-    try:
-        payload = json.loads(raw) if raw else {}
-    except json.JSONDecodeError:
-        print("{}")
-        return 0
-
-    if not isinstance(payload, dict):
-        print("{}")
-        return 0
-
-    inv_num = payload.get("invocationNum")
-    if isinstance(inv_num, int) and inv_num > 1:
-        print("{}")
-        return 0
-
-    user_input = payload.get("lastUserInput")
-    if not isinstance(user_input, str) or not user_input.strip():
-        print("{}")
-        return 0
-    cleaned_input = user_input.strip()
-    if cleaned_input.startswith("/"):
-        print("{}")
-        return 0
-
-    cfg = load_config(config_path)
-    ap_cfg = get_autopilot_config(cfg)
-    if not ap_cfg.get("enabled", True):
-        print("{}")
-        return 0
-
-    api_key = resolve_gemini_api_key()
-    if not api_key:
-        print("{}")
-        return 0
-
-    transcript_raw = payload.get("transcriptPath") or payload.get("transcript_path")
-    transcript_path = (
-        Path(transcript_raw.strip()).resolve()
-        if isinstance(transcript_raw, str) and transcript_raw.strip()
-        else None
-    )
-    recent_ctx = extract_recent_transcript_context(transcript_path)
-    prompt_text = (
-        f"Recent Conversation:\n{recent_ctx}\n\nCurrent User Request:\n{cleaned_input}"
-        if recent_ctx
-        else f"Current User Request:\n{cleaned_input}"
-    )
-
-    decision = call_decisions_api(prompt_text, api_key, ap_cfg)
-    if decision is None:
-        print("{}")
-        return 0
-
-    response_obj = build_autopilot_injection(decision, ap_cfg, plugin_root=config_path.parent)
-
-    cwd = payload.get("cwd") or (payload.get("workspacePaths") or [None])[0]
-    artifact_raw = payload.get("artifactDirectoryPath") or payload.get("artifact_directory_path")
-    artifact_dir = (
-        Path(artifact_raw.strip()).resolve()
-        if isinstance(artifact_raw, str) and artifact_raw.strip()
-        else None
-    )
-    repo = Path(cwd).resolve() if isinstance(cwd, str) and cwd and Path(cwd).is_dir() else None
-    telemetry_target = resolve_telemetry_target(repo=repo)
-    if telemetry_target is None and artifact_dir is not None:
-        telemetry_target = artifact_dir / "podo-telemetry.jsonl"
-    if telemetry_target is not None:
-        emit_telemetry_event(
-            cfg,
-            telemetry_target,
-            "autopilot_route",
-            conversation_id=str(payload.get("conversationId") or payload.get("conversation_id") or "").strip(),
-            role="autopilot",
-            model=str(ap_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"]),
-            gate="autopilot-router",
-            result=str(decision.get("mode") or "direct"),
-            violation_count=0,
-            duration_ms=(time.monotonic() - t0) * 1000.0,
-        )
-
-    print(json.dumps(response_obj, ensure_ascii=False))
     return 0
 
 

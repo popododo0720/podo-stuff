@@ -49,6 +49,8 @@
     "api_base_url": "https://generativelanguage.googleapis.com/v1beta/decisions",
     "confidence_threshold": 0.65,
     "arena_threshold": 0.7,
+    "complexity_min_for_swarm": 2.2,
+    "clarification_threshold": 0.9,
     "show_banner": true,
     "timeout_s": 5
   }

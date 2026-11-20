@@ -3,7 +3,7 @@
     "PreInvocation": [
       {
         "type": "command",
-        "command": "python3 ./scripts/podo-guard.py --hook-pre-invocation",
+        "command": "python3 ./scripts/podo-autopilot.py",
         "timeout": 8
       }
     ]

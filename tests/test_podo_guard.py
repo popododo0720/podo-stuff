@@ -1654,6 +1654,163 @@ class AutopilotRouterTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}, clear=False):
                 self.assertEqual(GUARD.resolve_gemini_api_key(home_dir=fake_home), "yaml-secret-key")
 
+    def test_dedup_complexity_gate_clarify_mode_stickiness_and_rich_telemetry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            plugin_data = root / "plugin-data"
+            transcript = root / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "캐시 아키텍처 설계해줘"}) + "\n",
+                encoding="utf-8",
+            )
+            env = {
+                "GEMINI_API_KEY": "test-key",
+                "PODO_ROLE": "",
+                "PODO_AUTOPILOT": "",
+                "PLUGIN_DATA": str(plugin_data),
+            }
+
+            plan_resp = {
+                "answers": {
+                    "mode": {
+                        "winning_option": "plan",
+                        "confidence": 0.84,
+                        "probabilities": {"plan": 0.84, "swarm": 0.1, "direct": 0.04, "grill": 0.02},
+                    },
+                    "needs_arena": {"noul": 0.15},
+                    "complexity": {"score": 2.8},
+                    "needs_clarification": {"noul": 0.12},
+                }
+            }
+            payload_turn1 = {
+                "invocationNum": 1,
+                "lastUserInput": "캐시 아키텍처 설계해줘",
+                "artifactDirectoryPath": str(artifact_dir),
+                "transcriptPath": str(transcript),
+                "conversationId": "conv-state-1",
+            }
+            rc1, out1, m1 = self._run_pre_invocation(payload_turn1, cfg_path, env_overrides=env, mock_response=plan_resp)
+            self.assertEqual(rc1, 0)
+            self.assertEqual(m1.call_count, 1)
+            self.assertIn("Podo Autopilot · Plan", out1["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+
+            rc_dup, out_dup, m_dup = self._run_pre_invocation(
+                payload_turn1,
+                cfg_path,
+                env_overrides=env,
+                mock_response=plan_resp,
+            )
+            self.assertEqual(rc_dup, 0)
+            self.assertEqual(out_dup, {})
+            self.assertEqual(m_dup.call_count, 0)
+
+            tel_lines = [
+                json.loads(line)
+                for line in (artifact_dir / "podo-telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(tel_lines), 1)
+            self.assertEqual(tel_lines[0]["result"], "plan")
+            self.assertEqual(tel_lines[0]["raw_mode"], "plan")
+            self.assertAlmostEqual(tel_lines[0]["confidence"], 0.84)
+            self.assertAlmostEqual(tel_lines[0]["complexity_score"], 2.8)
+            self.assertAlmostEqual(tel_lines[0]["needs_clarification_prob"], 0.12)
+            self.assertEqual(tel_lines[0]["previous_mode"], "")
+            self.assertTrue(tel_lines[0]["injected"])
+
+            captured_inputs: list[str] = []
+
+            class DummyResp:
+                def __init__(self, body: dict[str, Any]) -> None:
+                    self._raw = json.dumps(body).encode("utf-8")
+
+                def read(self) -> bytes:
+                    return self._raw
+
+                def __enter__(self) -> DummyResp:
+                    return self
+
+                def __exit__(self, *_args: Any) -> None:
+                    return None
+
+            swarm_resp = {
+                "answers": {
+                    "mode": {"winning_option": "swarm", "confidence": 0.9},
+                    "needs_arena": {"noul": 0.2},
+                    "complexity": {"score": 3.4},
+                    "needs_clarification": {"noul": 0.1},
+                }
+            }
+
+            def capture_urlopen(req: Any, timeout: float = 5.0) -> Any:
+                req_json = json.loads(req.data.decode("utf-8"))
+                captured_inputs.append(req_json["input"])
+                return DummyResp(swarm_resp)
+
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + json.dumps({"step_index": 2, "type": "USER_INPUT", "content": "좋아 2번 안으로 구현해줘"})
+                + "\n",
+                encoding="utf-8",
+            )
+            buf = io.StringIO()
+            payload_turn2 = {
+                "invocationNum": 1,
+                "lastUserInput": "좋아 2번 안으로 구현해줘",
+                "artifactDirectoryPath": str(artifact_dir),
+                "transcriptPath": str(transcript),
+                "conversationId": "conv-state-1",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload_turn2))),
+                mock.patch.object(GUARD.urllib.request, "urlopen", side_effect=capture_urlopen),
+                redirect_stdout(buf),
+            ):
+                rc2 = GUARD.handle_hook_pre_invocation(config_path=cfg_path)
+            self.assertEqual(rc2, 0)
+            self.assertTrue(captured_inputs)
+            self.assertIn("Previous Active Mode: plan", captured_inputs[0])
+
+            low_comp_resp = {
+                "answers": {
+                    "mode": {"winning_option": "swarm", "confidence": 0.85},
+                    "needs_arena": {"noul": 0.05},
+                    "complexity": {"score": 1.1},
+                    "needs_clarification": {"noul": 0.1},
+                }
+            }
+            rc_low, out_low, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "단일 파일 오타 고쳐줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=low_comp_resp,
+            )
+            self.assertEqual(rc_low, 0)
+            self.assertEqual(out_low, {})
+
+            ambig_resp = {
+                "answers": {
+                    "mode": {"winning_option": "swarm", "confidence": 0.82},
+                    "needs_arena": {"noul": 0.1},
+                    "complexity": {"score": 3.2},
+                    "needs_clarification": {"noul": 0.94},
+                }
+            }
+            rc_amb, out_amb, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "앱 전체 좋게 고쳐줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=ambig_resp,
+            )
+            self.assertEqual(rc_amb, 0)
+            self.assertIn("Podo Autopilot · Clarify", out_amb["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertIn("Do NOT spawn swarm workers yet", out_amb["injectSteps"][0]["systemMessage"]["systemMessage"])
+
 
 if __name__ == "__main__":
     unittest.main()
