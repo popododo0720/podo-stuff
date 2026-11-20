@@ -33,12 +33,16 @@ DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
 AUTOPILOT_SKIP_ROLES = {"builder", "scout", "interrogator", "monitor", "arena_a", "arena_b"}
 
 AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
+    "continues_previous_task": {
+        "type": "noul",
+        "instructions": "Does Current User Request continue, approve, or refine the task/plan discussed in Recent Conversation (as opposed to starting a brand-new unrelated question or topic)?",
+    },
     "mode": {
         "type": "choice",
-        "instructions": "Select the best execution strategy for the current user request, considering any Previous Active Mode context.",
+        "instructions": "First decide whether Current User Request continues/approves Recent Conversation or starts a new unrelated topic. If it is a new topic, ignore Recent Conversation and judge Current User Request alone. If it approves or continues a proposed plan/task (e.g., 'ㅇㅋ ㄱㄱ', 'go ahead'), judge mode based on the full agreed scope in Recent Conversation.",
         "criteria": {
             "direct": "Normal conversation, conceptual question, explanation, quick lookup, status check, or small single-file edit.",
-            "swarm": "Multi-file implementation, new feature build, broad refactoring, or autonomous end-to-end coding task (including approving a previous plan to start building) that benefits from parallel podo-swarm execution.",
+            "swarm": "Multi-file implementation, new feature build, broad refactoring, or autonomous end-to-end coding task (including approving a previously discussed multi-item plan to start building) that benefits from parallel podo-swarm execution.",
             "plan": "Architecture design, system trade-off analysis, or step-by-step planning requested before writing code.",
             "grill": "Adversarial code review, security or bug audit, or critical evaluation challenging flaws in code or design.",
         },
@@ -49,7 +53,7 @@ AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
     },
     "complexity": {
         "type": "score",
-        "instructions": "Estimate the engineering scope and parallelism benefit of this user request.",
+        "instructions": "Estimate the engineering scope and parallelism benefit. If Current User Request is a new unrelated topic, score Current User Request alone. If it approves or continues a plan/task from Recent Conversation, score the full agreed implementation scope.",
         "criteria": [
             "Trivial conversation, question, or lookup with no code changes",
             "Small localized edit in a single file",
@@ -66,6 +70,7 @@ AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
 
 API_KEY_YAML_RE = re.compile(r"^\s*api_key\s*:\s*['\"]?([^'\"#\s]+)['\"]?\s*$")
 SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+USER_REQUEST_TAG_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
 
 
 def utc_now_iso() -> str:
@@ -147,10 +152,10 @@ def resolve_gemini_api_key(home_dir: Path | None = None) -> str:
 
 def extract_recent_transcript_context(
     transcript_path: Path | None,
-    max_turns: int = 2,
-    max_chars: int = 1200,
+    max_turns: int = 3,
+    max_chars: int = 10000,
 ) -> str:
-    """Extract the most recent user and assistant text snippets from transcript.jsonl."""
+    """Extract the most recent user and assistant turns from transcript.jsonl."""
     recent_ctx, _ = inspect_transcript_for_autopilot(
         transcript_path,
         max_turns=max_turns,
@@ -159,10 +164,19 @@ def extract_recent_transcript_context(
     return recent_ctx
 
 
+def normalize_transcript_text(raw: str, max_turn_chars: int = 3000) -> str:
+    """Extract clean user/assistant text without metadata wrappers while bounding huge dumps."""
+    match = USER_REQUEST_TAG_RE.search(raw)
+    cleaned = match.group(1).strip() if match else raw.strip()
+    if len(cleaned) <= max_turn_chars:
+        return cleaned
+    return cleaned[-max_turn_chars:]
+
+
 def inspect_transcript_for_autopilot(
     transcript_path: Path | None,
-    max_turns: int = 2,
-    max_chars: int = 1200,
+    max_turns: int = 3,
+    max_chars: int = 10000,
 ) -> tuple[str, int]:
     """Return (recent_context_text, latest_user_step_index) from transcript.jsonl."""
     if transcript_path is None or not transcript_path.is_file():
@@ -173,7 +187,7 @@ def inspect_transcript_for_autopilot(
         lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return "", -1
-    for line in lines[-40:]:
+    for line in lines[-60:]:
         stripped = line.strip()
         if not stripped:
             continue
@@ -192,13 +206,17 @@ def inspect_transcript_for_autopilot(
         if not isinstance(content, str) or not content.strip():
             continue
         if step_type == "USER_INPUT":
-            snippets.append(f"User: {content.strip()[:300]}")
+            text = normalize_transcript_text(content)
+            if text:
+                snippets.append(f"User: {text}")
         elif step_type == "PLANNER_RESPONSE":
-            snippets.append(f"Assistant: {content.strip()[:300]}")
+            text = normalize_transcript_text(content)
+            if text:
+                snippets.append(f"Assistant: {text}")
     if not snippets:
         return "", latest_user_step
     selected = snippets[-(max_turns * 2) :]
-    joined = "\n".join(selected)
+    joined = "\n\n".join(selected)
     return joined[-max_chars:], latest_user_step
 
 
@@ -282,6 +300,13 @@ def parse_decisions_response(data: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(clar_val, (int, float)):
             clarification_prob = round(float(clar_val), 4)
 
+    continues_prob: float | None = None
+    cont_ans = answers.get("continues_previous_task")
+    if isinstance(cont_ans, dict):
+        cont_val = cont_ans.get("noul")
+        if isinstance(cont_val, (int, float)):
+            continues_prob = round(float(cont_val), 4)
+
     return {
         "mode": mode,
         "confidence": round(confidence, 4),
@@ -289,6 +314,7 @@ def parse_decisions_response(data: dict[str, Any]) -> dict[str, Any] | None:
         "needs_arena_prob": round(arena_prob, 4),
         "complexity_score": complexity_score,
         "needs_clarification_prob": clarification_prob,
+        "continues_previous_task_prob": continues_prob,
     }
 
 
@@ -460,6 +486,7 @@ def emit_autopilot_telemetry(
         "needs_arena_prob": decision.get("needs_arena_prob", 0.0),
         "complexity_score": decision.get("complexity_score"),
         "needs_clarification_prob": decision.get("needs_clarification_prob"),
+        "continues_previous_task_prob": decision.get("continues_previous_task_prob"),
         "previous_mode": previous_mode,
         "injected": bool(injected),
         "violation_count": 0,

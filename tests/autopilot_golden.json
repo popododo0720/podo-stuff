@@ -123,5 +123,29 @@
     "id": "direct-ko-explain-code",
     "input": "podo-guard.py에서 PreInvocation 훅이 어떤 순서로 동작하는지 설명해줘",
     "expected": ["direct"]
+  },
+  {
+    "id": "swarm-short-approval-ko",
+    "previous_mode": "plan",
+    "recent_context": "User: 1, 3, 4, 5, 6, 7번 구현하자\nAssistant: 최종 구현 범위입니다:\n1. 턴 중복 호출 제거 (PLUGIN_DATA 상태 저장)\n3. 텔레메트리 확률·복잡도 보강\n4. 다차원 gemini-decision-1 분류(complexity + clarification)\n5. 세션 모드 상태 유지\n6. 골든 테스트셋 + eval-autopilot.py\n7. 4300줄 podo-guard.py에서 scripts/podo/autopilot.py 모듈 분리\n\n이 6개 항목을 바로 구현하고 테스트 + install.sh + git 푸시까지 진행할까요?",
+    "input": "ㅇㅋ ㄱㄱ",
+    "expected": ["swarm"],
+    "expect_continuation": true
+  },
+  {
+    "id": "topic-switch-after-swarm-ko",
+    "previous_mode": "swarm",
+    "recent_context": "User: 결제 모듈 전체를 MSA로 분리하고 분산 락 + 통합 테스트까지 구현해줘\nAssistant: 4개 Phase 병렬 스웜으로 API 게이트웨이, 결제 워커, 정산 DB 마이그레이션, 통합 테스트를 모두 완료했습니다.",
+    "input": "근데 리눅스에서 디스크 용량 확인하는 명령어가 뭐야?",
+    "expected": ["direct"],
+    "expect_continuation": false
+  },
+  {
+    "id": "topic-switch-after-plan-en",
+    "previous_mode": "plan",
+    "recent_context": "User: Design a zero-downtime PostgreSQL sharding migration across 12 microservices.\nAssistant: Here is the 5-phase dual-write, backfill, shadow-read, cutover, and cleanup architecture plan.",
+    "input": "By the way, how do I check disk usage on Linux?",
+    "expected": ["direct"],
+    "expect_continuation": false
   }
 ]
