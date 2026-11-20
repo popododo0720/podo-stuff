@@ -1,0 +1,56 @@
+{
+  "active_preset": "podo-default",
+  "roles": {
+    "scout": "gemini-4-hydrogen-medium",
+    "builder": "gemini-pro-orchestrator-neon",
+    "arena_a": "gemini-pro-orchestrator-neon",
+    "arena_b": "claude-opus-5-5-medium",
+    "interrogator": "claude-opus-5-5-medium",
+    "monitor": "gemini-4-hydrogen-low"
+  },
+  "presets": {
+    "podo-default": {
+      "description": "Default popododo stack: Hydrogen Medium scouts, Orchestrator Neon builders, Neon vs Opus Medium arena, Opus Medium per-phase interrogator, Hydrogen Low monitor.",
+      "roles": {
+        "scout": "gemini-4-hydrogen-medium",
+        "builder": "gemini-pro-orchestrator-neon",
+        "arena_a": "gemini-pro-orchestrator-neon",
+        "arena_b": "claude-opus-5-5-medium",
+        "interrogator": "claude-opus-5-5-medium",
+        "monitor": "gemini-4-hydrogen-low"
+      }
+    },
+    "quota-saver-argon": {
+      "description": "Preserve Neon quota by shifting builders and arena_a to Orchestrator Argon while keeping Opus 5.5 Medium interrogation.",
+      "roles": {
+        "scout": "gemini-4-hydrogen-medium",
+        "builder": "gemini-pro-orchestrator-g1-pro",
+        "arena_a": "gemini-pro-orchestrator-g1-pro",
+        "arena_b": "claude-opus-5-5-medium",
+        "interrogator": "claude-opus-5-5-medium",
+        "monitor": "gemini-4-hydrogen-low"
+      }
+    },
+    "all-google": {
+      "description": "100% Google Gemini 4 pool using Argon High as cross-pool challenger and interrogator.",
+      "roles": {
+        "scout": "gemini-4-hydrogen-medium",
+        "builder": "gemini-pro-orchestrator-neon",
+        "arena_a": "gemini-pro-orchestrator-neon",
+        "arena_b": "gemini-4-argon-high",
+        "interrogator": "gemini-4-argon-high",
+        "monitor": "gemini-4-hydrogen-low"
+      }
+    }
+  },
+  "gates": {
+    "per_task_deterministic_script": true,
+    "interrogator_cadence": "per_dag_phase",
+    "allow_comment_tags": [
+      "WHY:",
+      "INVARIANT:",
+      "SAFETY:",
+      "NOTE(popododo):"
+    ]
+  }
+}

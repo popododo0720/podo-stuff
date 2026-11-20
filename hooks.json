@@ -1,0 +1,11 @@
+{
+  "podo-deterministic-gate": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/podo-guard.py --hook-stop",
+        "timeout": 15
+      }
+    ]
+  }
+}

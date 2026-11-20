@@ -1,0 +1,15 @@
+{
+  "name": "podo-stuff",
+  "displayName": "Podo Stuff (pstack + OmO DAG)",
+  "description": "Deterministic pstack structural guardrails, AST narration-comment gate, per-phase DAG swarm orchestration, and Arena bake-offs on top of native Antigravity Swarm.",
+  "version": "1.0.0",
+  "author": "popododo",
+  "homepage": "https://github.com/popododo0720/podo-stuff",
+  "repository": "https://github.com/popododo0720/podo-stuff",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "/podo-setup Show live quotas and inspect my podo-stuff role routing",
+    "/podo-swarm Implement this feature with max-parallel DAG phases and per-phase Opus interrogation",
+    "/podo-swarm arena: Solve this tricky concurrency bug by competing Orchestrator Neon vs Claude Opus 5.5"
+  ]
+}
