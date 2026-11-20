@@ -27,6 +27,7 @@ DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "complexity_min_for_swarm": 2.2,
     "clarification_threshold": 0.90,
     "boundary_plan_threshold": 0.75,
+    "egm_plan_review": True,
     "show_banner": True,
     "timeout_s": 5,
 }
@@ -125,6 +126,8 @@ def get_autopilot_config(cfg: dict[str, Any]) -> dict[str, Any]:
             merged["clarification_threshold"] = max(0.0, min(1.0, float(raw["clarification_threshold"])))
         if isinstance(raw.get("boundary_plan_threshold"), (int, float)):
             merged["boundary_plan_threshold"] = max(0.0, min(1.0, float(raw["boundary_plan_threshold"])))
+        if "egm_plan_review" in raw:
+            merged["egm_plan_review"] = bool(raw["egm_plan_review"])
         if "show_banner" in raw:
             merged["show_banner"] = bool(raw["show_banner"])
         if isinstance(raw.get("timeout_s"), (int, float)) and raw["timeout_s"] > 0:
@@ -375,12 +378,21 @@ def evaluate_autopilot_decision_detailed(
     needs_arena = float(decision.get("needs_arena_prob") or 0.0) >= arena_threshold
     complexity_score = decision.get("complexity_score")
     clarification_prob = decision.get("needs_clarification_prob")
+    egm_plan_review = bool(autopilot_cfg.get("egm_plan_review", True))
     show_banner = bool(autopilot_cfg.get("show_banner", True))
 
     is_complex = isinstance(complexity_score, (int, float)) and float(complexity_score) >= complexity_min
     is_low_complexity = isinstance(complexity_score, (int, float)) and float(complexity_score) < complexity_min
     is_high_ambiguity = (
         isinstance(clarification_prob, (int, float)) and float(clarification_prob) >= clarification_threshold
+    )
+    use_egm_review = egm_plan_review and is_complex
+    egm_note = " · Goldfish 설계 검증" if use_egm_review else ""
+    egm_directive = (
+        " If `egm-design`, `egm-zoom-out`, and `egm-implementation-readiness` subagents are available, "
+        "invoke them in parallel (or via `egm-synthesizer`) to run a fresh-eyes Goldfish audit on your drafted plan before presenting the final plan."
+        if use_egm_review
+        else ""
     )
 
     if is_complex and is_high_ambiguity:
@@ -426,10 +438,11 @@ def evaluate_autopilot_decision_detailed(
             )
             effective_mode = "grill"
         else:
-            banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
+            banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct}{egm_note})*"
             directive = (
                 f"[Podo Autopilot Router] gemini-decision-1 classified this request as PLAN (confidence={conf_pct}). "
                 "Present a concise architecture design, key trade-offs, and a concrete step-by-step execution plan before making code edits."
+                + egm_directive
             )
             effective_mode = "plan"
 
@@ -443,12 +456,13 @@ def evaluate_autopilot_decision_detailed(
         mass_pct = f"{swarm_plan_mass:.0%}"
         banner = (
             f"🏗️ **[Podo Autopilot · Plan]** 규모가 큰 작업이지만 바로 구현/설계 경계선이라 실행 계획을 먼저 제안합니다. "
-            f"*(설계+구현 확률 {mass_pct})*"
+            f"*(설계+구현 확률 {mass_pct}{egm_note})*"
         )
         directive = (
             f"[Podo Autopilot Router] gemini-decision-1 saw a complex task on the swarm/plan boundary "
             f"(P(swarm)+P(plan)={mass_pct}, complexity={float(complexity_score):.2f}). "
             "Present a concise architecture and step-by-step execution plan first so the user can approve before spawning parallel workers."
+            + egm_directive
         )
         sys_msg = {"systemMessage": directive}
         if show_banner:

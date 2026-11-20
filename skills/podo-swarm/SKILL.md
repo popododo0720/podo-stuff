@@ -47,6 +47,7 @@ Pass `BASE_SHA` explicitly into every `builder` and `interrogator` brief so comm
 3. **Partition Into Disjoint DAG Phases (`phase-1`, `phase-2`, ...)**:
    - Maximize parallelism within every Phase by splitting independent work along **strictly disjoint file ownership**. Two `builder` workers in the same Phase must **never** touch the same file.
    - Dependent follow-up work goes into the next Phase (`depends_on`).
+   - For high-risk or multi-phase architectural swarms, if `egm-design`, `egm-zoom-out`, and `egm-implementation-readiness` subagents (from the Elephant-Goldfish Model plugin) are available, optionally run a fresh-eyes Goldfish review on the drafted DAG plan before spawning builders. Keep `interrogator` strictly for Tier-2 code, diff, and test verification.
 4. **Initialize Live DAG Artifacts (`podo-dag.state.json` / `podo-dag.md` / `podo-dag.html`)**:
    - Use your conversation's artifact directory (`<appDataDir>/brain/<conversation-id>/`):
      ```bash

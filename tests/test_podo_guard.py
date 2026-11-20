@@ -1831,7 +1831,27 @@ class AutopilotRouterTests(unittest.TestCase):
             )
             self.assertEqual(rc_bnd, 0)
             self.assertIn("Podo Autopilot · Plan", out_bnd["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertIn("Goldfish 설계 검증", out_bnd["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
             self.assertIn("swarm/plan boundary", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertIn("egm-design", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            simple_plan_resp = {
+                "answers": {
+                    "mode": {"winning_option": "plan", "confidence": 0.85},
+                    "needs_arena": {"noul": 0.05},
+                    "complexity": {"score": 1.5},
+                    "needs_clarification": {"noul": 0.1},
+                }
+            }
+            rc_sp, out_sp, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "이 함수 리팩터링 순서 잡아줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=simple_plan_resp,
+            )
+            self.assertEqual(rc_sp, 0)
+            self.assertNotIn("egm-design", out_sp["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertNotIn("Goldfish", out_sp["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
 
 
 if __name__ == "__main__":
