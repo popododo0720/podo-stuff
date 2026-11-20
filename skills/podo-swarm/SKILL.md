@@ -5,7 +5,8 @@ description: >-
   /swarm without modifying built-in swarm internals. Automatically decomposes work
   into maximum-parallel DAG phases, runs zero-token deterministic checks per task,
   batches context-isolated interrogator verification once per DAG phase boundary,
-  supports cross-pool Arena bake-offs, and keeps an offline DAG dashboard synced.
+  supports cross-pool Arena bake-offs, and keeps an offline Gantt DAG dashboard
+  and observability telemetry synced.
 ---
 
 # Podo Swarm — Phased DAG Orchestrator
@@ -56,7 +57,8 @@ Pass `BASE_SHA` explicitly into every `builder` and `interrogator` brief so comm
        --title "<Swarm Goal>" \
        --phases-json '<phases_json>'
      ```
-   - Present `[podo-dag.html](file://<artifact_dir>/podo-dag.html)` (100% offline HTML dashboard) to the user.
+   - `podo-dag.state.json` automatically tracks `started_at`, `finished_at`, `duration_s`, and `interrogator_calls` on every phase and node as transitions occur (active states set `started_at`; `verified`/`rejected` set `finished_at` and `duration_s`).
+   - Present `[podo-dag.html](file://<artifact_dir>/podo-dag.html)` (100% offline HTML dashboard featuring the **Phase & Worker Timeline (Gantt View)** and the **Observability & Token Estimate** panel) to the user.
 
 ---
 
@@ -68,10 +70,12 @@ Never spend `interrogator` turns on individual micro-tasks. Split verification i
 Every `builder` (`model: <roles.builder>`, `workspace: "share"`) MUST follow these rules in its brief:
 - Own **only** its assigned files; never edit files outside its slice.
 - Follow `no-comments` and `[DEAD-CODE]` rules (zero inline narration comments inside function bodies, zero unreachable code, zero unused imports or unused private helpers).
-- Before posting readiness, run the deterministic checker with `--base <BASE_SHA>` plus the target repository's own tests/typecheck/build for its slice:
+- Before posting readiness, run the deterministic checker with `--base <BASE_SHA>` plus the target repository's own tests/typecheck/build for its slice. When `.podo/` telemetry is enabled (or `--telemetry-file` / `PODO_TELEMETRY_FILE` is set), tag the invocation with `--phase`, `--worker`, and `--role` (or export `PODO_PHASE`, `PODO_WORKER`, `PODO_ROLE`):
   ```bash
-  python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check --repo . --base <BASE_SHA> --run-verify
+  python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check \
+    --repo . --base <BASE_SHA> --phase phase-N --worker <worker-name> --role builder --run-verify
   ```
+  (Plain `check` never auto-creates `.podo/` in clean repos unless `.podo/` already exists or `--telemetry-file` is passed.)
 - If `podo-guard.py check` or project tests exit non-zero, the `builder` **fixes all violations itself in the same turn** without waking `@interrogator`.
 - Commit changes in its shared workspace only after `exit 0` and passing tests, then post **ONLY** the compact structured status line with **zero prose rationalizations**:
   ```text
@@ -87,7 +91,8 @@ Add **one** `interrogator` (`model: <roles.interrogator>`, `workspace: "inherit"
     1. The explicit **task contract** (requirements and disjoint file boundaries),
     2. The actual **git diff** (`git diff <BASE_SHA>...HEAD` + working tree / untracked files) and deterministic check run:
        ```bash
-       python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check --repo <workspace_or_repo> --base <BASE_SHA> --run-verify
+       python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check \
+         --repo <workspace_or_repo> --base <BASE_SHA> --phase phase-N --worker interrogator --role interrogator --run-verify
        ```
     3. Direct **command/test execution proof** run against the target project's own checks.
   - Inspect all Phase `N` branches/diffs together for integration conflicts, edge cases, concurrency/state invariants, and missing assertions.
@@ -107,7 +112,7 @@ Trigger **Arena mode** when the user writes `arena:`, asks to compare approaches
 1. Spawn two independent contenders with `workspace: "share"` on the exact same task brief and `BASE_SHA`:
    - `contender-a` (`model: <roles.arena_a>`)
    - `contender-b` (`model: <roles.arena_b>`)
-2. Require **both** contenders to pass Tier 1 (`podo-guard.py check --repo . --base <BASE_SHA> --run-verify` + target project tests) before posting the compact contract line:
+2. Require **both** contenders to pass Tier 1 (`podo-guard.py check --repo . --base <BASE_SHA> --role arena_a|arena_b --run-verify` + target project tests) before posting the compact contract line:
    ```text
    @interrogator [arena-ready] task=<task-id> branch=<branch> base=<BASE_SHA> cmd="<verify-cmd>" exit=0
    ```
@@ -119,19 +124,35 @@ Trigger **Arena mode** when the user writes `arena:`, asks to compare approaches
 
 ---
 
-## Step 4: Native Swarm UI + Phase-Boundary Batch DAG Sync
+## Step 4: Native Swarm UI, Phase-Boundary Batch DAG Sync & Final Observability Report
 
 1. Name the swarm concisely: `swarm{action: "title", title: "podo-swarm: <goal>"}`.
 2. Add `monitor` (`model: <roles.monitor>`) if `swarm_monitor` is in your skill list.
 3. **Restrict `dag update` to Phase Boundaries Using Batch `--set-nodes`**:
-   - Do **not** invoke `dag update` on every individual micro-event. Update the DAG strictly at Phase boundaries (Phase start, `[reject]` cycle, or `[phase-N-verified]`) in a single batched call:
+   - Do **not** invoke `dag update` on every individual micro-event. Update the DAG strictly at Phase boundaries (Phase start, `[reject]` cycle, or `[phase-N-verified]`) in a single batched call (which also records timestamps, durations, `interrogator_calls`, and re-renders the offline Gantt timeline + observability panel):
      ```bash
      python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py dag update \
        --state-file "<artifact_dir>/podo-dag.state.json" \
        --set-nodes "task-1=verified,task-2=verified" \
        --phase "phase-1" --gate-status "verified" --note "<concise proof>"
      ```
+   - Optional `--started-at` and `--finished-at` flags override auto-captured timestamps when needed.
    - Supported statuses: `pending`, `building`, `script_checked`, `arena_running`, `phase_interrogating`, `rejected`, `verified`.
 4. Merge shared workspaces (`git merge` / `cherry-pick` from verified worker branches) into the main workspace as each Phase completes, then kill finished workers only after their work is safely landed (never kill `monitor` early).
 5. Always end the creation turn (and status replies) with the exact `open_board` string returned by `swarm` on its own line, alongside a link to `[podo-dag.html](file://<artifact_dir>/podo-dag.html)`.
-6. When the final Phase passes, post `[done] <summary>` (with NO `@mention`) to quiet `monitor`, run final `podo-guard.py check --repo . --base <BASE_SHA> --run-verify` on the merged workspace, and present the summary + final DAG artifact link.
+6. When the final Phase passes:
+   - Post `[done] <summary>` (with NO `@mention`) to quiet `monitor`.
+   - Run final `podo-guard.py check --repo . --base <BASE_SHA> --run-verify` on the merged workspace.
+   - Generate the final observability report and session snapshot to review gate pass/fail breakdown, estimated role token usage, Tier-1 saved tokens, anomaly warnings, and `trace-index.json` links:
+     ```bash
+     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py telemetry snapshot \
+       --repo . \
+       --state-file "<artifact_dir>/podo-dag.state.json" \
+       --conversation-id "<conversation_id>" \
+       --transcript-path "<artifact_dir>/.system_generated/logs/transcript.jsonl" \
+       --artifact-dir "<artifact_dir>"
+     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py telemetry report \
+       --repo . \
+       --state-file "<artifact_dir>/podo-dag.state.json"
+     ```
+   - Present the final summary, observability highlights, and `[podo-dag.html](file://<artifact_dir>/podo-dag.html)` link to the user.

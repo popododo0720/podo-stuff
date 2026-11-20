@@ -163,6 +163,26 @@ MERMAID_STATUS_BADGE = {
     "verified": "✅ verified",
 }
 
+DEFAULT_TELEMETRY_ROLE_AVG_TOKENS: dict[str, int] = {
+    "scout": 12000,
+    "builder": 28000,
+    "arena_a": 32000,
+    "arena_b": 32000,
+    "interrogator": 25000,
+    "monitor": 4000,
+}
+
+DEFAULT_TELEMETRY_ANOMALY_THRESHOLDS: dict[str, float] = {
+    "interrogator_calls_per_phase_warn": 2.0,
+    "gate_fail_rate_warn": 0.35,
+    "interrogator_history_multiplier_warn": 2.0,
+}
+
+ACTIVE_DAG_STATUSES = {"building", "arena_running", "script_checked", "phase_interrogating"}
+TERMINAL_DAG_STATUSES = {"verified", "rejected"}
+INTERROGATOR_CALL_STATUSES = {"phase_interrogating", "rejected", "verified"}
+VIOLATION_FILE_RE = re.compile(r"^\[[^\]]+\]\s+([^\s:]+):\d+")
+
 
 def default_config() -> dict[str, Any]:
     """Return a fresh copy of the default podo-config schema."""
@@ -175,6 +195,11 @@ def default_config() -> dict[str, Any]:
             "dead_code_check": True,
             "interrogator_cadence": "per_dag_phase",
             "allow_comment_tags": list(DEFAULT_ALLOW_TAGS),
+        },
+        "telemetry": {
+            "enabled": True,
+            "role_avg_tokens": dict(DEFAULT_TELEMETRY_ROLE_AVG_TOKENS),
+            "anomaly_thresholds": dict(DEFAULT_TELEMETRY_ANOMALY_THRESHOLDS),
         },
     }
 
@@ -212,6 +237,52 @@ def is_dead_code_check_enabled(cfg: dict[str, Any]) -> bool:
     return True
 
 
+def is_telemetry_enabled(cfg: dict[str, Any]) -> bool:
+    """Return whether JSONL telemetry emission is enabled."""
+    telemetry = cfg.get("telemetry", {})
+    if isinstance(telemetry, dict) and "enabled" in telemetry:
+        return bool(telemetry["enabled"])
+    return True
+
+
+def get_role_avg_tokens(cfg: dict[str, Any]) -> dict[str, int]:
+    """Return per-role average token estimates merged with defaults."""
+    merged = dict(DEFAULT_TELEMETRY_ROLE_AVG_TOKENS)
+    telemetry = cfg.get("telemetry", {})
+    if isinstance(telemetry, dict):
+        raw = telemetry.get("role_avg_tokens")
+        if isinstance(raw, dict):
+            for role, val in raw.items():
+                if isinstance(val, (int, float)) and val >= 0:
+                    merged[str(role)] = int(val)
+    return merged
+
+
+def get_anomaly_thresholds(cfg: dict[str, Any]) -> dict[str, float]:
+    """Return telemetry anomaly thresholds merged with defaults."""
+    merged = dict(DEFAULT_TELEMETRY_ANOMALY_THRESHOLDS)
+    telemetry = cfg.get("telemetry", {})
+    if isinstance(telemetry, dict):
+        raw = telemetry.get("anomaly_thresholds")
+        if isinstance(raw, dict):
+            for key, val in raw.items():
+                if isinstance(val, (int, float)) and val >= 0:
+                    merged[str(key)] = float(val)
+    return merged
+
+
+def get_role_model(cfg: dict[str, Any], role: str) -> str:
+    """Return configured model id for a role, or empty string if unknown."""
+    if not role:
+        return ""
+    roles = cfg.get("roles", {})
+    if isinstance(roles, dict):
+        model = roles.get(role)
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return DEFAULT_ROLES.get(role, "")
+
+
 def resolve_stop_hook_mode(cfg: dict[str, Any]) -> str:
     """Resolve effective Stop hook mode with PODO_GUARD_MODE overriding config."""
     env_mode = os.environ.get("PODO_GUARD_MODE", "").strip().lower()
@@ -227,12 +298,7 @@ def resolve_stop_hook_mode(cfg: dict[str, Any]) -> str:
 def get_interrogator_model(cfg: dict[str, Any] | None = None) -> str:
     """Return the active interrogator model configured in podo-config.json."""
     resolved = cfg if cfg is not None else load_config(DEFAULT_CONFIG_PATH)
-    roles = resolved.get("roles", {})
-    if isinstance(roles, dict):
-        model = roles.get("interrogator")
-        if isinstance(model, str) and model.strip():
-            return model.strip()
-    return DEFAULT_ROLES["interrogator"]
+    return get_role_model(resolved, "interrogator") or DEFAULT_ROLES["interrogator"]
 
 
 def strip_comment_marker(comment_text: str) -> str:
@@ -1284,8 +1350,654 @@ def resolve_diff_text_arg(arg: str | None) -> str | None:
     return arg
 
 
+def utc_now_iso() -> str:
+    """Return current UTC timestamp formatted in ISO-8601 Zulu form."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso_timestamp(value: str | None) -> float | None:
+    """Parse an ISO-8601 timestamp string into POSIX epoch seconds."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def compute_duration_s(started_at: str | None, finished_at: str | None) -> float | None:
+    """Return non-negative duration in seconds between two ISO timestamps."""
+    t_start = parse_iso_timestamp(started_at)
+    t_end = parse_iso_timestamp(finished_at)
+    if t_start is None or t_end is None:
+        return None
+    return round(max(0.0, t_end - t_start), 2)
+
+
+def format_duration_s(duration_s: float | None) -> str:
+    """Format duration in seconds into a compact display label."""
+    if duration_s is None:
+        return "-"
+    return f"{duration_s:.1f}s"
+
+
+def sanitize_identifier(raw: str) -> str:
+    """Convert an identifier into a filesystem-safe filename token."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw.strip())
+    return cleaned.strip("._") or "session"
+
+
+def classify_violation_gate(violations: list[str]) -> str:
+    """Classify the deterministic gate category represented by violation lines."""
+    if not violations:
+        return "all"
+    tags: set[str] = set()
+    for line in violations:
+        if line.startswith("[GIT-BASE]"):
+            tags.add("git_base")
+        elif line.startswith("[NO-COMMENTS]"):
+            tags.add("no_comments")
+        elif line.startswith("[DEAD-CODE]"):
+            tags.add("dead_code")
+        elif line.startswith("[STRUCTURAL-CHECK"):
+            tags.add("structural")
+        elif line.startswith("[VERIFY-SCRIPT]"):
+            tags.add("verify_script")
+    return ",".join(sorted(tags)) if tags else "check"
+
+
+def extract_violation_files(violations: list[str], fallback_files: set[str] | None = None) -> list[str]:
+    """Extract sorted relative file paths referenced by violations or fallback filter."""
+    found: set[str] = set()
+    for line in violations:
+        match = VIOLATION_FILE_RE.match(line)
+        if match:
+            found.add(match.group(1))
+    if not found and fallback_files:
+        found.update(fallback_files)
+    return sorted(found)
+
+
+def resolve_telemetry_target(
+    explicit_path: str | None = None,
+    repo: Path | None = None,
+    state_path: Path | None = None,
+) -> Path | None:
+    """Resolve JSONL telemetry target path without auto-creating <repo>/.podo/."""
+    if explicit_path and explicit_path.strip():
+        return Path(explicit_path.strip()).resolve()
+    env_path = os.environ.get("PODO_TELEMETRY_FILE", "").strip()
+    if env_path:
+        return Path(env_path).resolve()
+    if state_path is not None:
+        return state_path.resolve().parent / "podo-telemetry.jsonl"
+    if repo is not None and (repo / ".podo").is_dir():
+        return repo / ".podo" / "telemetry.jsonl"
+    return None
+
+
+def emit_telemetry_event(
+    cfg: dict[str, Any],
+    target_path: Path | None,
+    event: str,
+    *,
+    conversation_id: str = "",
+    phase: str = "",
+    worker: str = "",
+    role: str = "",
+    model: str = "",
+    gate: str = "",
+    result: str = "",
+    violation_count: int = 0,
+    files: list[str] | None = None,
+    duration_ms: float = 0.0,
+) -> bool:
+    """Append a structured JSONL telemetry event if telemetry is enabled and target exists."""
+    if not is_telemetry_enabled(cfg) or target_path is None:
+        return False
+    record = {
+        "ts": round(time.time(), 3),
+        "iso_ts": utc_now_iso(),
+        "event": event,
+        "conversation_id": conversation_id,
+        "phase": phase,
+        "worker": worker,
+        "role": role,
+        "model": model,
+        "gate": gate,
+        "result": result,
+        "violation_count": int(violation_count),
+        "files": list(files or []),
+        "duration_ms": round(max(0.0, float(duration_ms)), 2),
+    }
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with target_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def read_telemetry_events(telemetry_path: Path | None) -> list[dict[str, Any]]:
+    """Read structured JSONL telemetry events safely, skipping malformed lines."""
+    if telemetry_path is None or not telemetry_path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        lines = telemetry_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events
+
+
+def collect_telemetry_paths(
+    *,
+    explicit_path: Path | None = None,
+    repo: Path | None = None,
+    state_path: Path | None = None,
+    artifact_dir: Path | None = None,
+) -> list[Path]:
+    """Collect deduplicated existing telemetry JSONL paths for a session."""
+    if explicit_path is not None:
+        resolved = explicit_path.resolve()
+        return [resolved] if resolved.is_file() else []
+
+    env_path = os.environ.get("PODO_TELEMETRY_FILE", "").strip()
+    if env_path:
+        resolved = Path(env_path).resolve()
+        return [resolved] if resolved.is_file() else []
+
+    candidates: list[Path] = []
+    if repo is not None:
+        candidates.append(repo / ".podo" / "telemetry.jsonl")
+    if state_path is not None:
+        state_dir = state_path.resolve().parent
+        candidates.append(state_dir / "podo-telemetry.jsonl")
+        candidates.append(state_dir / "telemetry.jsonl")
+    if artifact_dir is not None:
+        art_dir = artifact_dir.resolve()
+        candidates.append(art_dir / "podo-telemetry.jsonl")
+        candidates.append(art_dir / "telemetry.jsonl")
+
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for cand in candidates:
+        resolved = cand.resolve()
+        if resolved not in seen and resolved.is_file():
+            seen.add(resolved)
+            existing.append(resolved)
+    return existing
+
+
+def read_merged_telemetry_events(paths: list[Path]) -> list[dict[str, Any]]:
+    """Read and chronologically merge JSONL events across multiple telemetry files."""
+    merged: list[dict[str, Any]] = []
+    for path in paths:
+        merged.extend(read_telemetry_events(path))
+    merged.sort(key=lambda ev: float(ev.get("ts") or 0.0))
+    return merged
+
+
+def extract_tool_call_info(tc: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Extract normalized (tool_name, args_dict) from a transcript tool_call object."""
+    fn_obj = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+    tool_name = str(tc.get("name") or tc.get("tool_name") or fn_obj.get("name") or "").strip()
+    raw_args = tc.get("args") or tc.get("arguments") or fn_obj.get("arguments") or {}
+    if isinstance(raw_args, str):
+        try:
+            raw_args = json.loads(raw_args)
+        except json.JSONDecodeError:
+            raw_args = {}
+    if not isinstance(raw_args, dict):
+        raw_args = {}
+    return tool_name, raw_args
+
+
+def summarize_transcript(transcript_path: Path | None) -> dict[str, Any]:
+    """Parse transcript.jsonl safely to summarize steps, user turns, and tool call counts."""
+    counts: dict[str, int] = {}
+    steps = 0
+    user_turns = 0
+    if transcript_path is not None and transcript_path.is_file():
+        try:
+            raw_lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            raw_lines = []
+        for line in raw_lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            steps += 1
+            if obj.get("type") == "USER_INPUT":
+                user_turns += 1
+            tool_calls = obj.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if not isinstance(tc, dict):
+                        continue
+                    tool_name, _ = extract_tool_call_info(tc)
+                    if tool_name:
+                        counts[tool_name] = counts.get(tool_name, 0) + 1
+    return {
+        "transcript_steps_count": steps,
+        "user_turns_count": user_turns,
+        "tool_call_counts": dict(sorted(counts.items())),
+    }
+
+
+def infer_node_role(node: dict[str, Any], known_roles: set[str]) -> str:
+    """Infer configured role name from explicit node role or worker prefix."""
+    explicit = str(node.get("role") or "").strip().lower()
+    if explicit in known_roles:
+        return explicit
+    worker = str(node.get("worker") or "").strip().lower()
+    if not worker:
+        return "builder"
+    if worker in known_roles:
+        return worker
+    if "arena-a" in worker or "arena_a" in worker:
+        return "arena_a"
+    if "arena-b" in worker or "arena_b" in worker:
+        return "arena_b"
+    if worker.startswith("scout"):
+        return "scout"
+    if worker.startswith("interrogator"):
+        return "interrogator"
+    if worker.startswith("monitor"):
+        return "monitor"
+    return "builder"
+
+
+def collect_historical_interrogator_calls(
+    snapshots_dir: Path | None,
+    exclude_conversation_id: str = "",
+) -> list[int]:
+    """Read interrogator_calls counts from prior session snapshots."""
+    if snapshots_dir is None or not snapshots_dir.is_dir():
+        return []
+    exclude_stem = sanitize_identifier(exclude_conversation_id) if exclude_conversation_id else ""
+    history: list[int] = []
+    for snap_file in sorted(snapshots_dir.glob("*.json")):
+        if exclude_stem and snap_file.stem == exclude_stem:
+            continue
+        try:
+            snap = json.loads(snap_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(snap, dict):
+            continue
+        if exclude_conversation_id and snap.get("conversation_id") == exclude_conversation_id:
+            continue
+        calls: int | None = None
+        tok = snap.get("token_estimates")
+        if isinstance(tok, dict):
+            by_role = tok.get("by_role")
+            if isinstance(by_role, dict):
+                ig = by_role.get("interrogator")
+                if isinstance(ig, dict) and isinstance(ig.get("calls"), (int, float)):
+                    calls = int(ig["calls"])
+        if calls is None:
+            dag_sum = snap.get("dag_summary")
+            if isinstance(dag_sum, dict) and isinstance(dag_sum.get("total_interrogator_calls"), (int, float)):
+                calls = int(dag_sum["total_interrogator_calls"])
+        if calls is not None and calls >= 0:
+            history.append(calls)
+    return history
+
+
+def compute_observability_snapshot(
+    *,
+    cfg: dict[str, Any],
+    state: dict[str, Any] | None = None,
+    events: list[dict[str, Any]] | None = None,
+    repo: Path | None = None,
+    conversation_id: str = "",
+    transcript_path: Path | None = None,
+    artifact_dir: Path | None = None,
+    telemetry_path: Path | None = None,
+    snapshot_path: Path | None = None,
+    state_path: Path | None = None,
+    snapshots_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Compute a complete observability snapshot combining DAG, telemetry, token estimates, anomalies, and traces."""
+    now = utc_now_iso()
+    all_events = list(events or [])
+    role_avg_tokens = get_role_avg_tokens(cfg)
+    thresholds = get_anomaly_thresholds(cfg)
+    known_roles = set(role_avg_tokens.keys())
+
+    phases = state.get("phases", []) if isinstance(state, dict) else []
+    phase_summaries: list[dict[str, Any]] = []
+    total_nodes = 0
+    total_verified = 0
+    total_rejected = 0
+    total_active = 0
+    total_pending = 0
+    dag_interrogator_calls = 0
+    dag_role_calls: dict[str, int] = {}
+    last_verdict = "pending"
+    phase_durations: list[float] = []
+
+    for ph in phases:
+        ph_nodes = ph.get("nodes", [])
+        n_total = len(ph_nodes)
+        n_verified = sum(1 for n in ph_nodes if n.get("status") == "verified")
+        n_rejected = sum(1 for n in ph_nodes if n.get("status") == "rejected")
+        n_active = sum(1 for n in ph_nodes if n.get("status") in ACTIVE_DAG_STATUSES)
+        n_pending = max(0, n_total - n_verified - n_rejected - n_active)
+
+        total_nodes += n_total
+        total_verified += n_verified
+        total_rejected += n_rejected
+        total_active += n_active
+        total_pending += n_pending
+
+        gate_status = str(ph.get("gate_status") or "pending")
+        if gate_status in INTERROGATOR_CALL_STATUSES:
+            last_verdict = gate_status
+        ph_calls = int(ph.get("interrogator_calls") or 0)
+        if ph_calls == 0 and gate_status in INTERROGATOR_CALL_STATUSES:
+            ph_calls = 1
+        dag_interrogator_calls += ph_calls
+
+        for node in ph_nodes:
+            if node.get("worker") or node.get("status") != "pending":
+                inferred = infer_node_role(node, known_roles)
+                dag_role_calls[inferred] = dag_role_calls.get(inferred, 0) + 1
+
+        ph_dur = ph.get("duration_s")
+        if ph_dur is None:
+            ph_dur = compute_duration_s(ph.get("started_at"), ph.get("finished_at"))
+        if isinstance(ph_dur, (int, float)):
+            phase_durations.append(float(ph_dur))
+
+        phase_summaries.append(
+            {
+                "id": str(ph.get("id") or ""),
+                "name": str(ph.get("name") or ""),
+                "gate_status": gate_status,
+                "started_at": ph.get("started_at"),
+                "finished_at": ph.get("finished_at"),
+                "duration_s": ph_dur,
+                "interrogator_calls": ph_calls,
+                "node_counts": {
+                    "total": n_total,
+                    "verified": n_verified,
+                    "rejected": n_rejected,
+                    "active": n_active,
+                    "pending": n_pending,
+                },
+            }
+        )
+
+    if dag_interrogator_calls > 0:
+        dag_role_calls["interrogator"] = dag_interrogator_calls
+
+    pass_count = 0
+    fail_count = 0
+    observe_count = 0
+    by_gate: dict[str, dict[str, int]] = {}
+    by_phase: dict[str, dict[str, int]] = {}
+    by_worker: dict[str, dict[str, int]] = {}
+    event_role_calls: dict[str, int] = {}
+    event_phases: set[str] = set()
+
+    def bump_bucket(table: dict[str, dict[str, int]], key: str, outcome: str) -> None:
+        bucket = table.setdefault(key, {"pass": 0, "fail": 0, "observe": 0, "total": 0})
+        bucket[outcome] += 1
+        bucket["total"] += 1
+
+    for ev in all_events:
+        ev_type = str(ev.get("event") or "")
+        ev_result = str(ev.get("result") or "")
+        ev_role = str(ev.get("role") or "").strip().lower()
+        ev_phase = str(ev.get("phase") or "").strip()
+        ev_worker = str(ev.get("worker") or "").strip()
+        ev_gate = str(ev.get("gate") or "").strip()
+
+        if ev_phase:
+            event_phases.add(ev_phase)
+        if ev_role in known_roles:
+            if ev_type in {"check", "hook_stop", "dag_update"}:
+                event_role_calls[ev_role] = event_role_calls.get(ev_role, 0) + 1
+        if ev_type == "dag_update" and ev_gate == "interrogator_gate" and ev_result in INTERROGATOR_CALL_STATUSES:
+            last_verdict = ev_result
+
+        if ev_type in {"check", "hook_stop"} and ev_result in {"pass", "fail", "observe"}:
+            if ev_result == "pass":
+                pass_count += 1
+            elif ev_result == "fail":
+                fail_count += 1
+            else:
+                observe_count += 1
+            bump_bucket(by_gate, ev_gate or "all", ev_result)
+            bump_bucket(by_phase, ev_phase or "unassigned", ev_result)
+            bump_bucket(by_worker, ev_worker or "unassigned", ev_result)
+
+    total_gate_runs = pass_count + fail_count + observe_count
+    failure_rate = round(fail_count / total_gate_runs, 4) if total_gate_runs > 0 else 0.0
+
+    by_role: dict[str, dict[str, int]] = {}
+    all_seen_roles = sorted(set(dag_role_calls.keys()) | set(event_role_calls.keys()))
+    for role_name in all_seen_roles:
+        calls = max(dag_role_calls.get(role_name, 0), event_role_calls.get(role_name, 0))
+        if calls <= 0:
+            continue
+        avg_tok = int(role_avg_tokens.get(role_name, 0))
+        by_role[role_name] = {
+            "calls": calls,
+            "avg_tokens": avg_tok,
+            "estimated_tokens": calls * avg_tok,
+        }
+
+    total_estimated_tokens = sum(item["estimated_tokens"] for item in by_role.values())
+    interrogator_avg = int(role_avg_tokens.get("interrogator", 25000))
+    batched_saved = max(0, total_nodes - len(phases)) if phases else 0
+    tier1_saved_tokens = (fail_count + observe_count + batched_saved) * interrogator_avg
+
+    phase_divisor = max(1, len(phases) if phases else len(event_phases))
+    interrogator_calls_total = by_role.get("interrogator", {}).get("calls", 0)
+    anomalies: list[dict[str, Any]] = []
+
+    churn_threshold = thresholds["interrogator_calls_per_phase_warn"]
+    if interrogator_calls_total > 0 and (interrogator_calls_total / phase_divisor) >= churn_threshold:
+        ratio = round(interrogator_calls_total / phase_divisor, 2)
+        anomalies.append(
+            {
+                "code": "HIGH_INTERROGATOR_CHURN",
+                "severity": "warn",
+                "value": ratio,
+                "threshold": churn_threshold,
+                "message": f"Interrogator churn {ratio:.2f} calls/phase >= {churn_threshold}",
+            }
+        )
+
+    fail_threshold = thresholds["gate_fail_rate_warn"]
+    if total_gate_runs > 0 and failure_rate >= fail_threshold:
+        anomalies.append(
+            {
+                "code": "HIGH_GATE_FAIL_RATE",
+                "severity": "warn",
+                "value": failure_rate,
+                "threshold": fail_threshold,
+                "message": f"Gate fail rate {failure_rate:.2%} >= {fail_threshold:.2%}",
+            }
+        )
+
+    resolved_snapshots_dir = snapshots_dir
+    if resolved_snapshots_dir is None and repo is not None and (repo / ".podo" / "snapshots").is_dir():
+        resolved_snapshots_dir = repo / ".podo" / "snapshots"
+
+    prior_calls = collect_historical_interrogator_calls(
+        resolved_snapshots_dir,
+        exclude_conversation_id=conversation_id,
+    )
+    if prior_calls:
+        historical_avg = sum(prior_calls) / len(prior_calls)
+        mult_threshold = thresholds["interrogator_history_multiplier_warn"]
+        if historical_avg > 0 and interrogator_calls_total >= mult_threshold * historical_avg:
+            anomalies.append(
+                {
+                    "code": "INTERROGATOR_SPIKE_VS_HISTORY",
+                    "severity": "warn",
+                    "value": interrogator_calls_total,
+                    "historical_avg": round(historical_avg, 2),
+                    "threshold": mult_threshold,
+                    "message": (
+                        f"Interrogator calls ({interrogator_calls_total}) >= "
+                        f"{mult_threshold}x historical avg ({historical_avg:.2f})"
+                    ),
+                }
+            )
+
+    transcript_stats = summarize_transcript(transcript_path)
+    trace_link = {
+        "conversation_id": conversation_id,
+        "updated_at": now,
+        "transcript_path": str(transcript_path) if transcript_path else "",
+        "artifact_dir": str(artifact_dir) if artifact_dir else "",
+        "telemetry_file": str(telemetry_path) if telemetry_path else "",
+        "snapshot_file": str(snapshot_path) if snapshot_path else "",
+        "dag_state_file": str(state_path) if state_path else "",
+        "transcript_steps_count": transcript_stats["transcript_steps_count"],
+        "user_turns_count": transcript_stats["user_turns_count"],
+        "tool_call_counts": transcript_stats["tool_call_counts"],
+    }
+
+    return {
+        "conversation_id": conversation_id,
+        "updated_at": now,
+        "dag_summary": {
+            "title": str(state.get("title") or "") if isinstance(state, dict) else "",
+            "phase_count": len(phases),
+            "phases": phase_summaries,
+            "node_counts": {
+                "total": total_nodes,
+                "verified": total_verified,
+                "rejected": total_rejected,
+                "active": total_active,
+                "pending": total_pending,
+            },
+            "total_duration_s": round(sum(phase_durations), 2) if phase_durations else None,
+            "total_interrogator_calls": interrogator_calls_total,
+            "last_interrogator_verdict": last_verdict,
+        },
+        "gate_metrics": {
+            "total": total_gate_runs,
+            "pass": pass_count,
+            "fail": fail_count,
+            "observe": observe_count,
+            "failure_rate": failure_rate,
+            "by_gate": by_gate,
+            "by_phase": by_phase,
+            "by_worker": by_worker,
+        },
+        "token_estimates": {
+            "by_role": by_role,
+            "total_estimated_tokens": total_estimated_tokens,
+            "tier1_saved_tokens": tier1_saved_tokens,
+            "anomalies": anomalies,
+        },
+        "trace_link": trace_link,
+    }
+
+
+def update_trace_index(index_path: Path, trace_entry: dict[str, Any]) -> None:
+    """Upsert a session trace entry inside trace-index.json."""
+    if index_path.is_file():
+        try:
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                data = {"sessions": {}}
+        except (json.JSONDecodeError, OSError):
+            data = {"sessions": {}}
+    else:
+        data = {"sessions": {}}
+    sessions = data.setdefault("sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+        data["sessions"] = sessions
+    session_key = str(trace_entry.get("conversation_id") or "").strip() or "session"
+    sessions[session_key] = trace_entry
+    data["updated_at"] = trace_entry.get("updated_at") or utc_now_iso()
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def discover_observability_paths(
+    repo: Path,
+    state_file_arg: str | None = None,
+    telemetry_file_arg: str | None = None,
+    artifact_dir_arg: str | None = None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    """Resolve (state_path, telemetry_path, artifact_dir) from explicit args or repo defaults."""
+    artifact_dir = Path(artifact_dir_arg).resolve() if artifact_dir_arg else None
+
+    state_path: Path | None = None
+    if state_file_arg:
+        state_path = Path(state_file_arg).resolve()
+    elif artifact_dir and (artifact_dir / "podo-dag.state.json").is_file():
+        state_path = artifact_dir / "podo-dag.state.json"
+    elif (repo / ".podo" / "podo-dag.state.json").is_file():
+        state_path = repo / ".podo" / "podo-dag.state.json"
+
+    telemetry_path: Path | None = None
+    if telemetry_file_arg:
+        telemetry_path = Path(telemetry_file_arg).resolve()
+    elif os.environ.get("PODO_TELEMETRY_FILE", "").strip():
+        telemetry_path = Path(os.environ["PODO_TELEMETRY_FILE"].strip()).resolve()
+    elif state_path and (state_path.parent / "podo-telemetry.jsonl").is_file():
+        telemetry_path = state_path.parent / "podo-telemetry.jsonl"
+    elif (repo / ".podo" / "telemetry.jsonl").is_file():
+        telemetry_path = repo / ".podo" / "telemetry.jsonl"
+    elif artifact_dir and (artifact_dir / "podo-telemetry.jsonl").is_file():
+        telemetry_path = artifact_dir / "podo-telemetry.jsonl"
+
+    if state_path is None and telemetry_path and (telemetry_path.parent / "podo-dag.state.json").is_file():
+        state_path = telemetry_path.parent / "podo-dag.state.json"
+
+    return state_path, telemetry_path, artifact_dir
+
+
+def load_json_dict(path: Path | None) -> dict[str, Any] | None:
+    """Read a JSON object from disk, returning None on absence or parse failure."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     """Execute deterministic comment, AST dead-code, structural check, and optional verify.sh gates."""
+    t0 = time.monotonic()
     repo = Path(args.repo).resolve()
     cfg = load_config(Path(args.config).resolve() if args.config else DEFAULT_CONFIG_PATH)
     allow_tags = get_allow_tags(cfg)
@@ -1308,16 +2020,47 @@ def cmd_check(args: argparse.Namespace) -> int:
     if args.run_verify:
         violations.extend(run_verify_script(repo))
 
+    has_git_base_error = any(v.startswith("[GIT-BASE]") for v in violations)
+    if not violations:
+        outcome = "pass"
+        exit_code = 0
+    elif args.mode == "observe" and not has_git_base_error:
+        outcome = "observe"
+        exit_code = 0
+    else:
+        outcome = "fail"
+        exit_code = 1
+
+    phase = (args.phase or os.environ.get("PODO_PHASE", "")).strip()
+    worker = (args.worker or os.environ.get("PODO_WORKER", "")).strip()
+    role = (args.role or os.environ.get("PODO_ROLE", "")).strip().lower()
+    conv_id = os.environ.get("PODO_CONVERSATION_ID", "").strip()
+    telemetry_target = resolve_telemetry_target(explicit_path=args.telemetry_file, repo=repo)
+    emit_telemetry_event(
+        cfg,
+        telemetry_target,
+        "check",
+        conversation_id=conv_id,
+        phase=phase,
+        worker=worker,
+        role=role,
+        model=get_role_model(cfg, role),
+        gate=classify_violation_gate(violations),
+        result=outcome,
+        violation_count=len(violations),
+        files=extract_violation_files(violations, fallback_files=file_filter),
+        duration_ms=(time.monotonic() - t0) * 1000.0,
+    )
+
     if violations:
-        has_git_base_error = any(v.startswith("[GIT-BASE]") for v in violations)
-        if args.mode == "observe" and not has_git_base_error:
+        if outcome == "observe":
             print(f"[podo-guard] OBSERVE (non-blocking): {len(violations)} violation(s) detected:")
             for line in violations:
                 print(line)
             return 0
         for line in violations:
             print(line)
-        return 1
+        return exit_code
 
     print("[podo-guard] OK: 0 violations (no-comments, dead-code & structural checks passed).")
     return 0
@@ -1325,11 +2068,13 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 def cmd_codify(args: argparse.Namespace) -> int:
     """Record a deterministic structural check in <repo>/.podo/checks.json."""
+    t0 = time.monotonic()
     if not args.regex and not args.cmd:
         print("Error: specify either --regex or --cmd", file=sys.stderr)
         return 2
 
     repo = Path(args.repo).resolve()
+    cfg = load_config(Path(args.config).resolve() if args.config else DEFAULT_CONFIG_PATH)
     podo_dir = repo / ".podo"
     podo_dir.mkdir(parents=True, exist_ok=True)
     checks_file = podo_dir / "checks.json"
@@ -1360,51 +2105,222 @@ def cmd_codify(args: argparse.Namespace) -> int:
     checks.append(entry)
     data["checks"] = checks
     checks_file.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    telemetry_target = resolve_telemetry_target(explicit_path=getattr(args, "telemetry_file", None), repo=repo)
+    emit_telemetry_event(
+        cfg,
+        telemetry_target,
+        "codify",
+        conversation_id=os.environ.get("PODO_CONVERSATION_ID", "").strip(),
+        phase=os.environ.get("PODO_PHASE", "").strip(),
+        worker=os.environ.get("PODO_WORKER", "").strip(),
+        role=os.environ.get("PODO_ROLE", "").strip().lower(),
+        gate="structural",
+        result="ok",
+        violation_count=0,
+        files=[".podo/checks.json"],
+        duration_ms=(time.monotonic() - t0) * 1000.0,
+    )
     print(f"[podo-guard] Codified structural check '{args.id}' into {checks_file}")
     return 0
 
 
-def normalize_phases(raw: Any) -> list[dict[str, Any]]:
-    """Normalize input phase specification into a consistent schema."""
+def apply_status_timestamps(
+    item: dict[str, Any],
+    status: str | None,
+    now: str,
+    started_override: str | None = None,
+    finished_override: str | None = None,
+) -> None:
+    """Update started_at, finished_at, and duration_s on a DAG phase or node."""
+    if started_override:
+        item["started_at"] = started_override
+    if finished_override:
+        item["finished_at"] = finished_override
+
+    if status in ACTIVE_DAG_STATUSES:
+        if not item.get("started_at"):
+            item["started_at"] = now
+        if not finished_override:
+            item["finished_at"] = None
+            item["duration_s"] = None
+    elif status in TERMINAL_DAG_STATUSES:
+        if not item.get("started_at"):
+            item["started_at"] = now
+        if not item.get("finished_at"):
+            item["finished_at"] = now
+
+    item["duration_s"] = compute_duration_s(item.get("started_at"), item.get("finished_at"))
+
+
+def normalize_phases(raw: Any, now: str | None = None) -> list[dict[str, Any]]:
+    """Normalize input phase specification into a consistent schema with timing metadata."""
     phases = raw.get("phases", []) if isinstance(raw, dict) else raw
     if not isinstance(phases, list):
         raise ValueError("phases JSON must be a list or an object with a 'phases' list")
+    ts_now = now or utc_now_iso()
 
     normalized: list[dict[str, Any]] = []
     for idx, ph in enumerate(phases, start=1):
         ph_id = str(ph.get("id") or f"phase-{idx}")
-        ph_name = str(ph.get("name") or f"Phase {idx}")
+        ph_name = str(ph.get("name") or ph.get("title") or f"Phase {idx}")
         gate_status = str(ph.get("gate_status") or "pending")
         gate_note = str(ph.get("gate_note") or "")
+        ph_started = ph.get("started_at") or None
+        ph_finished = ph.get("finished_at") or None
+        ph_calls = int(ph.get("interrogator_calls") or 0)
+        if ph_calls == 0 and gate_status in INTERROGATOR_CALL_STATUSES:
+            ph_calls = 1
+
         nodes: list[dict[str, Any]] = []
         for nidx, node in enumerate(ph.get("nodes", []), start=1):
-            nodes.append(
-                {
-                    "id": str(node.get("id") or f"{ph_id}-task-{nidx}"),
-                    "title": str(node.get("title") or node.get("id") or f"Task {nidx}"),
-                    "worker": str(node.get("worker") or ""),
-                    "model": str(node.get("model") or ""),
-                    "files": [str(f) for f in node.get("files", [])],
-                    "depends_on": [str(d) for d in node.get("depends_on", [])],
-                    "status": str(node.get("status") or "pending"),
-                    "note": str(node.get("note") or ""),
-                }
-            )
-        normalized.append(
-            {
-                "id": ph_id,
-                "name": ph_name,
-                "gate_status": gate_status,
-                "gate_note": gate_note,
-                "nodes": nodes,
+            n_status = str(node.get("status") or "pending")
+            n_started = node.get("started_at") or None
+            n_finished = node.get("finished_at") or None
+            node_entry: dict[str, Any] = {
+                "id": str(node.get("id") or f"{ph_id}-task-{nidx}"),
+                "title": str(node.get("title") or node.get("id") or f"Task {nidx}"),
+                "worker": str(node.get("worker") or ""),
+                "role": str(node.get("role") or ""),
+                "model": str(node.get("model") or ""),
+                "files": [str(f) for f in node.get("files", [])],
+                "depends_on": [str(d) for d in node.get("depends_on", [])],
+                "status": n_status,
+                "note": str(node.get("note") or ""),
+                "started_at": n_started,
+                "finished_at": n_finished,
+                "duration_s": node.get("duration_s"),
             }
-        )
+            apply_status_timestamps(node_entry, n_status, ts_now)
+            if node_entry["started_at"] and not ph_started:
+                ph_started = node_entry["started_at"]
+            nodes.append(node_entry)
+
+        phase_entry: dict[str, Any] = {
+            "id": ph_id,
+            "name": ph_name,
+            "gate_status": gate_status,
+            "gate_note": gate_note,
+            "started_at": ph_started,
+            "finished_at": ph_finished,
+            "duration_s": ph.get("duration_s"),
+            "interrogator_calls": ph_calls,
+            "nodes": nodes,
+        }
+        apply_status_timestamps(phase_entry, gate_status, ts_now)
+        normalized.append(phase_entry)
     return normalized
 
 
-def render_dag_markdown(state: dict[str, Any], cfg: dict[str, Any] | None = None) -> str:
-    """Render DAG state into a Markdown summary with Mermaid flowchart and role-based Interrogator Gate table."""
-    interrogator_model = get_interrogator_model(cfg)
+def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compute relative horizontal Gantt timing bars across the DAG session window."""
+    phases = state.get("phases", [])
+    timestamps: list[float] = []
+    for key in ("created_at", "updated_at"):
+        parsed = parse_iso_timestamp(state.get(key))
+        if parsed is not None:
+            timestamps.append(parsed)
+    for ph in phases:
+        for field in ("started_at", "finished_at"):
+            parsed = parse_iso_timestamp(ph.get(field))
+            if parsed is not None:
+                timestamps.append(parsed)
+        for node in ph.get("nodes", []):
+            for field in ("started_at", "finished_at"):
+                parsed = parse_iso_timestamp(node.get(field))
+                if parsed is not None:
+                    timestamps.append(parsed)
+
+    window_start = min(timestamps) if timestamps else 0.0
+    window_end = max(timestamps) if timestamps else 1.0
+    span = max(1.0, window_end - window_start)
+
+    def make_row(
+        kind: str,
+        row_id: str,
+        label: str,
+        status: str,
+        started_at: str | None,
+        finished_at: str | None,
+        duration_s: float | None,
+    ) -> dict[str, Any]:
+        t_start = parse_iso_timestamp(started_at)
+        t_end = parse_iso_timestamp(finished_at)
+        resolved_dur = duration_s
+        if resolved_dur is None and t_start is not None and t_end is not None:
+            resolved_dur = round(max(0.0, t_end - t_start), 2)
+        if t_start is not None:
+            effective_end = max(t_start, t_end if t_end is not None else window_end)
+            left_pct = round(max(0.0, min(98.0, ((t_start - window_start) / span) * 100.0)), 2)
+            raw_width = ((effective_end - t_start) / span) * 100.0
+            width_pct = round(max(2.0, min(100.0 - left_pct, raw_width)), 2)
+        else:
+            left_pct = 0.0
+            width_pct = 0.0
+        return {
+            "kind": kind,
+            "id": row_id,
+            "label": label,
+            "status": status,
+            "started_at": started_at or "-",
+            "finished_at": finished_at or "-",
+            "duration_s": resolved_dur,
+            "duration_label": format_duration_s(resolved_dur),
+            "left_pct": left_pct,
+            "width_pct": width_pct,
+        }
+
+    rows: list[dict[str, Any]] = []
+    for ph in phases:
+        rows.append(
+            make_row(
+                "phase",
+                str(ph.get("id") or ""),
+                str(ph.get("name") or ph.get("id") or ""),
+                str(ph.get("gate_status") or "pending"),
+                ph.get("started_at"),
+                ph.get("finished_at"),
+                ph.get("duration_s"),
+            )
+        )
+        for node in ph.get("nodes", []):
+            worker = f" (@{node['worker']})" if node.get("worker") else ""
+            rows.append(
+                make_row(
+                    "node",
+                    str(node.get("id") or ""),
+                    f"{node.get('id')}: {node.get('title')}{worker}",
+                    str(node.get("status") or "pending"),
+                    node.get("started_at"),
+                    node.get("finished_at"),
+                    node.get("duration_s"),
+                )
+            )
+    return rows
+
+
+def gantt_bar_color_var(status: str) -> str:
+    """Map DAG node/phase status to an Antigravity semantic CSS color variable."""
+    if status == "verified":
+        return "var(--success)"
+    if status == "rejected":
+        return "var(--error)"
+    if status in {"arena_running", "phase_interrogating"}:
+        return "var(--warning)"
+    if status in {"building", "script_checked"}:
+        return "var(--primary)"
+    return "var(--muted-foreground)"
+
+
+def render_dag_markdown(
+    state: dict[str, Any],
+    cfg: dict[str, Any] | None = None,
+    observability: dict[str, Any] | None = None,
+) -> str:
+    """Render DAG state into Markdown with Mermaid flowchart, Gantt timeline, and observability panel."""
+    resolved_cfg = cfg if cfg is not None else load_config(DEFAULT_CONFIG_PATH)
+    interrogator_model = get_interrogator_model(resolved_cfg)
+    obs = observability or compute_observability_snapshot(cfg=resolved_cfg, state=state)
     lines = [
         f"# Podo Swarm DAG — {state['title']}",
         "",
@@ -1442,29 +2358,95 @@ def render_dag_markdown(state: dict[str, Any], cfg: dict[str, Any] | None = None
         [
             "```",
             "",
-            "| Phase | Task | Worker | Model | Status | Note |",
-            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+            "| Phase | Task | Worker | Model | Status | Duration | Note |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
         ]
     )
 
     for ph in phases:
         for node in ph.get("nodes", []):
             badge = MERMAID_STATUS_BADGE.get(node["status"], node["status"])
+            dur_str = format_duration_s(node.get("duration_s"))
             lines.append(
-                f"| {ph['name']} | `{node['id']}` {node['title']} | `{node.get('worker') or '-'}` | `{node.get('model') or '-'}` | {badge} | {node.get('note') or '-'} |"
+                f"| {ph['name']} | `{node['id']}` {node['title']} | `{node.get('worker') or '-'}` | `{node.get('model') or '-'}` | {badge} | `{dur_str}` | {node.get('note') or '-'} |"
             )
         gate_badge = MERMAID_STATUS_BADGE.get(ph["gate_status"], ph["gate_status"])
+        ph_dur_str = format_duration_s(ph.get("duration_s"))
         lines.append(
-            f"| {ph['name']} | **Interrogator Gate** | `interrogator` | `{interrogator_model}` | {gate_badge} | {ph.get('gate_note') or '-'} |"
+            f"| {ph['name']} | **Interrogator Gate** | `interrogator` | `{interrogator_model}` | {gate_badge} | `{ph_dur_str}` | {ph.get('gate_note') or '-'} |"
         )
+
+    gantt_rows = compute_gantt_rows(state)
+    lines.extend(
+        [
+            "",
+            "## Phase & Worker Timeline (Gantt View)",
+            "",
+            "| Scope | Status | Started | Finished | Duration | Window |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
+    for row in gantt_rows:
+        prefix = "**" if row["kind"] == "phase" else "↳ "
+        suffix = "**" if row["kind"] == "phase" else ""
+        window_str = (
+            f"`{row['left_pct']:.1f}%..{min(100.0, row['left_pct'] + row['width_pct']):.1f}%`"
+            if row["width_pct"] > 0
+            else "-"
+        )
+        lines.append(
+            f"| {prefix}{row['label']}{suffix} | `{row['status']}` | `{row['started_at']}` | `{row['finished_at']}` | `{row['duration_label']}` | {window_str} |"
+        )
+
+    tok_est = obs.get("token_estimates", {})
+    by_role = tok_est.get("by_role", {})
+    anomalies = tok_est.get("anomalies", [])
+    gate_metrics = obs.get("gate_metrics", {})
+
+    lines.extend(
+        [
+            "",
+            "## Observability & Token Estimate",
+            "",
+            f"- **Estimated Total Tokens**: `{tok_est.get('total_estimated_tokens', 0):,}`",
+            f"- **Tier-1 Saved Token Estimate**: `{tok_est.get('tier1_saved_tokens', 0):,}`",
+            (
+                f"- **Gate Checks**: `{gate_metrics.get('total', 0)}` "
+                f"(pass=`{gate_metrics.get('pass', 0)}`, fail=`{gate_metrics.get('fail', 0)}`, "
+                f"observe=`{gate_metrics.get('observe', 0)}`, fail_rate=`{gate_metrics.get('failure_rate', 0.0):.2%}`)"
+            ),
+            "",
+            "| Role | Calls | Avg Tokens/Call | Estimated Tokens |",
+            "| :--- | :--- | :--- | :--- |",
+        ]
+    )
+    if by_role:
+        for role_name, info in sorted(by_role.items()):
+            lines.append(
+                f"| `{role_name}` | `{info.get('calls', 0)}` | `{info.get('avg_tokens', 0):,}` | `{info.get('estimated_tokens', 0):,}` |"
+            )
+    else:
+        lines.append("| `-` | `0` | `0` | `0` |")
+
+    if anomalies:
+        lines.append("")
+        lines.append("### Anomaly Alerts")
+        for alert in anomalies:
+            lines.append(f"- **{alert.get('code')}**: {alert.get('message')}")
 
     lines.append("")
     return "\n".join(lines)
 
 
-def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) -> str:
-    """Render DAG state into a self-contained offline HTML dashboard using Antigravity semantic tokens."""
-    interrogator_model = get_interrogator_model(cfg)
+def render_dag_html(
+    state: dict[str, Any],
+    cfg: dict[str, Any] | None = None,
+    observability: dict[str, Any] | None = None,
+) -> str:
+    """Render DAG state into a self-contained offline HTML dashboard with Gantt timeline and observability."""
+    resolved_cfg = cfg if cfg is not None else load_config(DEFAULT_CONFIG_PATH)
+    interrogator_model = get_interrogator_model(resolved_cfg)
+    obs = observability or compute_observability_snapshot(cfg=resolved_cfg, state=state)
     phases = state.get("phases", [])
     total_nodes = sum(len(ph.get("nodes", [])) for ph in phases)
     verified_nodes = sum(
@@ -1474,7 +2456,7 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
         1
         for ph in phases
         for n in ph.get("nodes", [])
-        if n.get("status") in {"building", "script_checked", "arena_running", "phase_interrogating"}
+        if n.get("status") in ACTIVE_DAG_STATUSES
     )
     rejected_nodes = sum(
         1 for ph in phases for n in ph.get("nodes", []) if n.get("status") == "rejected"
@@ -1505,6 +2487,7 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
                 if node.get("note")
                 else ""
             )
+            dur_str = format_duration_s(node.get("duration_s"))
             chips_row = f'<div class="chips">{deps_html}{files_html}</div>' if (deps_html or files_html) else ""
             node_cards.append(
                 f"""
@@ -1520,6 +2503,8 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
                     <span class="meta-worker">@{html.escape(node.get("worker") or "unassigned")}</span>
                     <span>·</span>
                     <span class="mono">{html.escape(node.get("model") or "inherit")}</span>
+                    <span>·</span>
+                    <span class="mono">{html.escape(dur_str)}</span>
                   </div>
                   {chips_row}
                   {note_html}
@@ -1532,6 +2517,8 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
             if ph.get("gate_note")
             else ""
         )
+        ph_dur_str = format_duration_s(ph.get("duration_s"))
+        ph_calls = int(ph.get("interrogator_calls") or 0)
         phase_cards_html.append(
             f"""
             <section class="phase-card">
@@ -1539,9 +2526,10 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
                 <div class="phase-title-group">
                   <span class="phase-id">{html.escape(ph["id"])}</span>
                   <h2 class="phase-name">{html.escape(ph["name"])}</h2>
+                  <span class="muted mono">{html.escape(ph_dur_str)}</span>
                 </div>
                 <div class="gate-group">
-                  <span class="muted">Interrogator Gate ({html.escape(interrogator_model)}):</span>
+                  <span class="muted">Interrogator Gate ({html.escape(interrogator_model)} · {ph_calls}x):</span>
                   <span class="badge {gate_cls}">{html.escape(gate_label)}</span>
                 </div>
               </div>
@@ -1552,6 +2540,57 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
             </section>
             """
         )
+
+    gantt_rows = compute_gantt_rows(state)
+    gantt_rows_html: list[str] = []
+    for row in gantt_rows:
+        row_cls = "gantt-row gantt-phase" if row["kind"] == "phase" else "gantt-row gantt-node"
+        bar_color = gantt_bar_color_var(row["status"])
+        bar_html = (
+            f'<div class="gantt-bar" style="left: {row["left_pct"]}%; width: {row["width_pct"]}%; background: {bar_color};"></div>'
+            if row["width_pct"] > 0
+            else '<div class="gantt-bar-empty"></div>'
+        )
+        gantt_rows_html.append(
+            f"""
+            <div class="{row_cls}">
+              <div class="gantt-label">{html.escape(row["label"])}</div>
+              <div class="gantt-track">{bar_html}</div>
+              <div class="gantt-timing mono">
+                <span>{html.escape(row["duration_label"])}</span>
+                <span class="muted">{html.escape(row["started_at"])} → {html.escape(row["finished_at"])}</span>
+              </div>
+            </div>
+            """
+        )
+
+    tok_est = obs.get("token_estimates", {})
+    by_role = tok_est.get("by_role", {})
+    anomalies = tok_est.get("anomalies", [])
+    gate_metrics = obs.get("gate_metrics", {})
+
+    role_rows_html: list[str] = []
+    for role_name, info in sorted(by_role.items()):
+        role_rows_html.append(
+            f"""
+            <tr>
+              <td class="mono">{html.escape(role_name)}</td>
+              <td class="mono">{int(info.get("calls", 0))}</td>
+              <td class="mono">{int(info.get("avg_tokens", 0)):,}</td>
+              <td class="mono">{int(info.get("estimated_tokens", 0)):,}</td>
+            </tr>
+            """
+        )
+    if not role_rows_html:
+        role_rows_html.append('<tr><td colspan="4" class="muted">No role invocations recorded yet.</td></tr>')
+
+    if anomalies:
+        anomalies_html = "".join(
+            f'<div class="alert-item"><strong>{html.escape(str(a.get("code", "")))}</strong>: {html.escape(str(a.get("message", "")))}</div>'
+            for a in anomalies
+        )
+    else:
+        anomalies_html = '<div class="alert-ok">No anomalies detected.</div>'
 
     return f"""<!DOCTYPE html>
 <html>
@@ -1586,7 +2625,7 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     .muted {{ color: var(--muted-foreground); }}
     .page {{ max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }}
-    .header-card, .phase-card {{
+    .header-card, .phase-card, .panel-card {{
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
@@ -1616,9 +2655,10 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
     }}
     .stat-value {{ font-weight: 600; margin-left: 4px; color: var(--foreground); }}
     .stat-primary {{ color: var(--primary); }}
+    .stat-success {{ color: var(--success); }}
     .stat-error {{ color: var(--error); }}
-    .phase-card {{ display: flex; flex-direction: column; gap: 12px; }}
-    .phase-header {{
+    .phase-card, .panel-card {{ display: flex; flex-direction: column; gap: 12px; }}
+    .phase-header, .panel-header {{
       display: flex;
       flex-wrap: wrap;
       align-items: center;
@@ -1636,7 +2676,7 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12px;
     }}
-    .phase-name {{ margin: 0; font-size: 14px; font-weight: 600; color: var(--foreground); }}
+    .phase-name, .panel-title {{ margin: 0; font-size: 14px; font-weight: 600; color: var(--foreground); }}
     .nodes-grid {{
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
@@ -1696,6 +2736,58 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
     .badge-interrogating {{ border-color: var(--warning); color: var(--warning); }}
     .badge-rejected {{ border-color: var(--error); color: var(--error); }}
     .badge-verified {{ border-color: var(--success); color: var(--success); }}
+    .gantt-list {{ display: flex; flex-direction: column; gap: 8px; }}
+    .gantt-row {{
+      display: grid;
+      grid-template-columns: minmax(180px, 240px) 1fr minmax(180px, 290px);
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+    }}
+    .gantt-phase .gantt-label {{ font-weight: 600; color: var(--foreground); }}
+    .gantt-node .gantt-label {{ padding-left: 14px; color: var(--muted-foreground); }}
+    .gantt-track {{
+      position: relative;
+      height: 16px;
+      border-radius: 999px;
+      background: var(--background);
+      border: 1px solid var(--card-border);
+      overflow: hidden;
+    }}
+    .gantt-bar {{
+      position: absolute;
+      top: 2px;
+      bottom: 2px;
+      border-radius: 999px;
+      opacity: 0.9;
+    }}
+    .gantt-bar-empty {{ height: 100%; }}
+    .gantt-timing {{ display: flex; flex-direction: column; align-items: flex-end; font-size: 11px; }}
+    .obs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }}
+    .obs-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
+    .obs-table th, .obs-table td {{
+      text-align: left;
+      padding: 6px 8px;
+      border-bottom: 1px solid var(--card-border);
+    }}
+    .obs-table th {{ color: var(--muted-foreground); font-weight: 500; }}
+    .alert-item {{
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--warning);
+      background: var(--background);
+      color: var(--warning);
+      font-size: 12px;
+      margin-bottom: 6px;
+    }}
+    .alert-ok {{
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--success);
+      background: var(--background);
+      color: var(--success);
+      font-size: 12px;
+    }}
   </style>
 </head>
 <body>
@@ -1726,6 +2818,53 @@ def render_dag_html(state: dict[str, Any], cfg: dict[str, Any] | None = None) ->
     </header>
     <main class="page">
       {"".join(phase_cards_html)}
+      <section class="panel-card">
+        <div class="panel-header">
+          <h2 class="panel-title">Phase &amp; Worker Timeline (Gantt View)</h2>
+          <span class="muted mono">{len(gantt_rows)} items</span>
+        </div>
+        <div class="gantt-list">
+          {"".join(gantt_rows_html)}
+        </div>
+      </section>
+      <section class="panel-card">
+        <div class="panel-header">
+          <h2 class="panel-title">Observability &amp; Token Estimate</h2>
+          <div class="stats">
+            <div class="stat-pill">
+              <span class="muted">Estimated Tokens:</span>
+              <span class="stat-value mono">{int(tok_est.get("total_estimated_tokens", 0)):,}</span>
+            </div>
+            <div class="stat-pill">
+              <span class="muted">Tier-1 Saved:</span>
+              <span class="stat-value stat-success mono">{int(tok_est.get("tier1_saved_tokens", 0)):,}</span>
+            </div>
+            <div class="stat-pill">
+              <span class="muted">Gate Checks:</span>
+              <span class="stat-value mono">{int(gate_metrics.get("total", 0))} ({int(gate_metrics.get("pass", 0))} pass / {int(gate_metrics.get("fail", 0))} fail)</span>
+            </div>
+            <div class="stat-pill">
+              <span class="muted">Gate Fail Rate:</span>
+              <span class="stat-value mono">{float(gate_metrics.get("failure_rate", 0.0)):.1%}</span>
+            </div>
+          </div>
+        </div>
+        <div class="obs-grid">
+          <div>
+            <table class="obs-table">
+              <thead>
+                <tr><th>Role</th><th>Calls</th><th>Avg/Call</th><th>Estimated Tokens</th></tr>
+              </thead>
+              <tbody>
+                {"".join(role_rows_html)}
+              </tbody>
+            </table>
+          </div>
+          <div>
+            {anomalies_html}
+          </div>
+        </div>
+      </section>
     </main>
   </div>
 </body>
@@ -1737,29 +2876,66 @@ def write_dag_outputs(
     state: dict[str, Any],
     state_path: Path,
     cfg: dict[str, Any] | None = None,
+    telemetry_path: Path | None = None,
+    explicit_telemetry: bool = False,
+    repo: Path | None = None,
 ) -> None:
     """Persist DAG JSON state and re-render configured Markdown and HTML views."""
+    resolved_cfg = cfg if cfg is not None else load_config(DEFAULT_CONFIG_PATH)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    tel_paths = collect_telemetry_paths(
+        explicit_path=telemetry_path if explicit_telemetry else None,
+        repo=repo,
+        state_path=state_path,
+    )
+    events = read_merged_telemetry_events(tel_paths)
+    primary_tel = (telemetry_path if explicit_telemetry else None) or (tel_paths[0] if tel_paths else telemetry_path)
+    snapshots_dir = state_path.parent / "snapshots" if (state_path.parent / "snapshots").is_dir() else None
+    if snapshots_dir is None and repo is not None and (repo / ".podo" / "snapshots").is_dir():
+        snapshots_dir = repo / ".podo" / "snapshots"
+    obs = compute_observability_snapshot(
+        cfg=resolved_cfg,
+        state=state,
+        events=events,
+        repo=repo,
+        telemetry_path=primary_tel,
+        state_path=state_path,
+        snapshots_dir=snapshots_dir,
+    )
+    if not events:
+        snap_candidate = load_json_dict(state_path.parent / "podo-session-snapshot.json")
+        if snap_candidate and isinstance(snap_candidate.get("gate_metrics"), dict):
+            obs["gate_metrics"] = snap_candidate["gate_metrics"]
 
     md_out = state.get("md_out")
     if md_out:
         md_path = Path(md_out)
         md_path.parent.mkdir(parents=True, exist_ok=True)
-        md_path.write_text(render_dag_markdown(state, cfg=cfg), encoding="utf-8")
+        md_path.write_text(render_dag_markdown(state, cfg=resolved_cfg, observability=obs), encoding="utf-8")
 
     html_out = state.get("html_out")
     if html_out:
         html_path = Path(html_out)
         html_path.parent.mkdir(parents=True, exist_ok=True)
-        html_path.write_text(render_dag_html(state, cfg=cfg), encoding="utf-8")
+        html_path.write_text(render_dag_html(state, cfg=resolved_cfg, observability=obs), encoding="utf-8")
 
 
 def cmd_dag(args: argparse.Namespace) -> int:
     """Initialize or update the live Podo Swarm DAG state and artifacts."""
+    t0 = time.monotonic()
     state_path = Path(args.state_file).resolve()
     cfg = load_config(Path(args.config).resolve() if args.config else DEFAULT_CONFIG_PATH)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = utc_now_iso()
+    explicit_tel_arg = getattr(args, "telemetry_file", None)
+    explicit_tel = bool((explicit_tel_arg and explicit_tel_arg.strip()) or os.environ.get("PODO_TELEMETRY_FILE", "").strip())
+    repo_arg = getattr(args, "repo", None)
+    dag_repo = Path(repo_arg).resolve() if repo_arg else (state_path.parent.parent if state_path.parent.name == ".podo" else None)
+    telemetry_target = resolve_telemetry_target(
+        explicit_path=explicit_tel_arg,
+        state_path=state_path,
+    )
 
     if args.dag_action == "init":
         raw_arg = args.phases_json
@@ -1768,17 +2944,38 @@ def cmd_dag(args: argparse.Namespace) -> int:
             raw_json = json.loads(existing.read_text(encoding="utf-8"))
         else:
             raw_json = json.loads(raw_arg)
-        phases = normalize_phases(raw_json)
+        phases = normalize_phases(raw_json, now=now)
         md_out = str(Path(args.md_out).resolve()) if args.md_out else str(state_path.with_suffix(".md"))
         html_out = str(Path(args.html_out).resolve()) if args.html_out else str(state_path.with_suffix(".html"))
         state = {
             "title": args.title,
+            "created_at": now,
             "updated_at": now,
             "md_out": md_out,
             "html_out": html_out,
             "phases": phases,
         }
-        write_dag_outputs(state, state_path, cfg=cfg)
+        emit_telemetry_event(
+            cfg,
+            telemetry_target,
+            "dag_init",
+            conversation_id=os.environ.get("PODO_CONVERSATION_ID", "").strip(),
+            worker="coordinator",
+            role="coordinator",
+            gate="dag",
+            result="ok",
+            violation_count=0,
+            files=[state_path.name],
+            duration_ms=(time.monotonic() - t0) * 1000.0,
+        )
+        write_dag_outputs(
+            state,
+            state_path,
+            cfg=cfg,
+            telemetry_path=telemetry_target,
+            explicit_telemetry=explicit_tel,
+            repo=dag_repo,
+        )
         print(f"[podo-guard] Initialized DAG state={state_path} md={md_out} html={html_out}")
         return 0
 
@@ -1811,28 +3008,67 @@ def cmd_dag(args: argparse.Namespace) -> int:
 
     matched_batch: set[str] = set()
     updated = False
+    started_override = getattr(args, "started_at", None)
+    finished_override = getattr(args, "finished_at", None)
+
     for ph in state.get("phases", []):
+        ph.setdefault("started_at", None)
+        ph.setdefault("finished_at", None)
+        ph.setdefault("duration_s", None)
+        ph.setdefault("interrogator_calls", 0)
+
         if args.phase and ph.get("id") == args.phase:
             if args.gate_status:
                 ph["gate_status"] = args.gate_status
+                if args.gate_status in INTERROGATOR_CALL_STATUSES:
+                    ph["interrogator_calls"] = int(ph.get("interrogator_calls") or 0) + 1
             if args.note is not None:
                 ph["gate_note"] = args.note
+            apply_status_timestamps(
+                ph,
+                args.gate_status,
+                now,
+                started_override=started_override,
+                finished_override=finished_override,
+            )
             updated = True
+
         for node in ph.get("nodes", []):
+            node.setdefault("started_at", None)
+            node.setdefault("finished_at", None)
+            node.setdefault("duration_s", None)
             node_id = node.get("id")
+            node_status_changed: str | None = None
+            node_touched = False
+
             if args.node and node_id == args.node:
                 if args.status:
                     node["status"] = args.status
+                    node_status_changed = args.status
                 if args.worker is not None:
                     node["worker"] = args.worker
                 if args.model is not None:
                     node["model"] = args.model
                 if args.note is not None:
                     node["note"] = args.note
-                updated = True
+                node_touched = True
             if node_id in batch_updates:
                 node["status"] = batch_updates[node_id]
+                node_status_changed = batch_updates[node_id]
                 matched_batch.add(node_id)
+                node_touched = True
+
+            if node_touched:
+                apply_status_timestamps(
+                    node,
+                    node_status_changed,
+                    now,
+                    started_override=started_override,
+                    finished_override=finished_override,
+                )
+                if node.get("started_at") and not ph.get("started_at"):
+                    ph["started_at"] = node["started_at"]
+                    ph["duration_s"] = compute_duration_s(ph.get("started_at"), ph.get("finished_at"))
                 updated = True
 
     missing_nodes = sorted(set(batch_updates.keys()) - matched_batch)
@@ -1845,7 +3081,33 @@ def cmd_dag(args: argparse.Namespace) -> int:
         return 2
 
     state["updated_at"] = now
-    write_dag_outputs(state, state_path, cfg=cfg)
+    is_interrogator_call = bool(args.gate_status in INTERROGATOR_CALL_STATUSES)
+    ev_role = "interrogator" if is_interrogator_call else ""
+    ev_worker = "interrogator" if is_interrogator_call else (args.worker or "")
+    ev_model = get_interrogator_model(cfg) if is_interrogator_call else (args.model or "")
+    emit_telemetry_event(
+        cfg,
+        telemetry_target,
+        "dag_update",
+        conversation_id=os.environ.get("PODO_CONVERSATION_ID", "").strip(),
+        phase=args.phase or "",
+        worker=ev_worker,
+        role=ev_role,
+        model=ev_model,
+        gate="interrogator_gate" if is_interrogator_call else "dag",
+        result=args.gate_status or args.status or "ok",
+        violation_count=1 if args.gate_status == "rejected" else 0,
+        files=[state_path.name],
+        duration_ms=(time.monotonic() - t0) * 1000.0,
+    )
+    write_dag_outputs(
+        state,
+        state_path,
+        cfg=cfg,
+        telemetry_path=telemetry_target,
+        explicit_telemetry=explicit_tel,
+        repo=dag_repo,
+    )
     print(f"[podo-guard] Updated DAG state={state_path}")
     return 0
 
@@ -1956,16 +3218,7 @@ def inspect_turn_transcript(transcript_path: Path, repo: Path) -> tuple[bool, bo
         for tc in tool_calls:
             if not isinstance(tc, dict):
                 continue
-            fn_obj = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-            tool_name = str(tc.get("name") or tc.get("tool_name") or fn_obj.get("name") or "").strip()
-            raw_args = tc.get("args") or tc.get("arguments") or fn_obj.get("arguments") or {}
-            if isinstance(raw_args, str):
-                try:
-                    raw_args = json.loads(raw_args)
-                except json.JSONDecodeError:
-                    raw_args = {}
-            if not isinstance(raw_args, dict):
-                raw_args = {}
+            tool_name, raw_args = extract_tool_call_info(tc)
 
             if tool_name == "run_command":
                 saw_run_command = True
@@ -1982,8 +3235,203 @@ def inspect_turn_transcript(transcript_path: Path, repo: Path) -> tuple[bool, bo
     return saw_file_edit, saw_run_command, edited_files
 
 
+def write_session_snapshot(
+    *,
+    cfg: dict[str, Any],
+    repo: Path,
+    state_path: Path | None,
+    telemetry_path: Path | None,
+    conversation_id: str,
+    transcript_path: Path | None,
+    artifact_dir: Path | None,
+    out_path: Path | None = None,
+    explicit_telemetry: bool = False,
+) -> tuple[dict[str, Any], Path | None]:
+    """Build and persist a session observability snapshot and trace-index.json entry."""
+    podo_dir = repo / ".podo"
+    has_podo = podo_dir.is_dir()
+    safe_conv = sanitize_identifier(conversation_id)
+
+    primary_path: Path | None = None
+    if out_path is not None:
+        primary_path = out_path.resolve()
+    elif has_podo:
+        primary_path = podo_dir / "snapshots" / f"{safe_conv}.json"
+    elif artifact_dir is not None:
+        primary_path = artifact_dir / "podo-session-snapshot.json"
+
+    state = load_json_dict(state_path)
+    tel_paths = collect_telemetry_paths(
+        explicit_path=telemetry_path if explicit_telemetry else None,
+        repo=repo,
+        state_path=state_path,
+        artifact_dir=artifact_dir,
+    )
+    if not explicit_telemetry and telemetry_path is not None and telemetry_path.is_file():
+        resolved_extra = telemetry_path.resolve()
+        if resolved_extra not in tel_paths:
+            tel_paths.append(resolved_extra)
+    events = read_merged_telemetry_events(tel_paths)
+    primary_tel = (telemetry_path if explicit_telemetry else None) or (tel_paths[0] if tel_paths else telemetry_path)
+    snapshots_dir = podo_dir / "snapshots" if (podo_dir / "snapshots").is_dir() else None
+
+    snap = compute_observability_snapshot(
+        cfg=cfg,
+        state=state,
+        events=events,
+        repo=repo,
+        conversation_id=conversation_id,
+        transcript_path=transcript_path,
+        artifact_dir=artifact_dir,
+        telemetry_path=primary_tel,
+        snapshot_path=primary_path,
+        state_path=state_path,
+        snapshots_dir=snapshots_dir,
+    )
+
+    if primary_path is not None:
+        try:
+            primary_path.parent.mkdir(parents=True, exist_ok=True)
+            primary_path.write_text(json.dumps(snap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+    if has_podo and artifact_dir is not None and out_path is None:
+        mirror_path = artifact_dir / "podo-session-snapshot.json"
+        if mirror_path != primary_path:
+            try:
+                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                mirror_path.write_text(json.dumps(snap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+
+    if has_podo:
+        update_trace_index(podo_dir / "trace-index.json", snap["trace_link"])
+    elif out_path is not None:
+        update_trace_index(out_path.resolve().parent / "trace-index.json", snap["trace_link"])
+
+    return snap, primary_path
+
+
+def format_telemetry_report(snap: dict[str, Any]) -> str:
+    """Format an observability snapshot into a concise human-readable terminal report."""
+    dag = snap.get("dag_summary", {})
+    gates = snap.get("gate_metrics", {})
+    tok = snap.get("token_estimates", {})
+    trace = snap.get("trace_link", {})
+
+    lines = [
+        f"=== Podo Telemetry Report ({snap.get('updated_at', '')}) ===",
+        (
+            f"DAG: title='{dag.get('title') or '-'}' phases={dag.get('phase_count', 0)} "
+            f"tasks={dag.get('node_counts', {}).get('verified', 0)}/{dag.get('node_counts', {}).get('total', 0)} "
+            f"interrogator_calls={dag.get('total_interrogator_calls', 0)} "
+            f"last_verdict={dag.get('last_interrogator_verdict', 'pending')} "
+            f"duration={format_duration_s(dag.get('total_duration_s'))}"
+        ),
+        (
+            f"Gates: total={gates.get('total', 0)} pass={gates.get('pass', 0)} "
+            f"fail={gates.get('fail', 0)} observe={gates.get('observe', 0)} "
+            f"failure_rate={float(gates.get('failure_rate', 0.0)):.2%}"
+        ),
+        (
+            f"Tokens: estimated={int(tok.get('total_estimated_tokens', 0)):,} "
+            f"tier1_saved={int(tok.get('tier1_saved_tokens', 0)):,}"
+        ),
+    ]
+
+    by_role = tok.get("by_role", {})
+    if by_role:
+        lines.append("Roles:")
+        for role_name, info in sorted(by_role.items()):
+            lines.append(
+                f"  - {role_name}: calls={info.get('calls', 0)} "
+                f"avg={int(info.get('avg_tokens', 0)):,} est={int(info.get('estimated_tokens', 0)):,}"
+            )
+
+    anomalies = tok.get("anomalies", [])
+    if anomalies:
+        lines.append("Anomalies:")
+        for alert in anomalies:
+            lines.append(f"  - [{alert.get('code')}] {alert.get('message')}")
+    else:
+        lines.append("Anomalies: none")
+
+    if trace.get("conversation_id") or trace.get("transcript_path"):
+        lines.append(
+            f"Trace: conversation={trace.get('conversation_id') or '-'} "
+            f"steps={trace.get('transcript_steps_count', 0)} "
+            f"user_turns={trace.get('user_turns_count', 0)}"
+        )
+
+    return "\n".join(lines)
+
+
+def cmd_telemetry(args: argparse.Namespace) -> int:
+    """Execute telemetry report or snapshot subcommands."""
+    repo = Path(args.repo).resolve()
+    cfg = load_config(Path(args.config).resolve() if args.config else DEFAULT_CONFIG_PATH)
+    explicit_tel = bool(
+        (args.telemetry_file and args.telemetry_file.strip())
+        or os.environ.get("PODO_TELEMETRY_FILE", "").strip()
+    )
+
+    if args.telemetry_action == "report":
+        state_path, telemetry_path, _ = discover_observability_paths(
+            repo,
+            state_file_arg=args.state_file,
+            telemetry_file_arg=args.telemetry_file,
+        )
+        state = load_json_dict(state_path)
+        tel_paths = collect_telemetry_paths(
+            explicit_path=telemetry_path if explicit_tel else None,
+            repo=repo,
+            state_path=state_path,
+        )
+        events = read_merged_telemetry_events(tel_paths)
+        primary_tel = (telemetry_path if explicit_tel else None) or (tel_paths[0] if tel_paths else telemetry_path)
+        snap = compute_observability_snapshot(
+            cfg=cfg,
+            state=state,
+            events=events,
+            repo=repo,
+            telemetry_path=primary_tel,
+            state_path=state_path,
+        )
+        if args.json:
+            print(json.dumps(snap, indent=2, ensure_ascii=False))
+        else:
+            print(format_telemetry_report(snap))
+        return 0
+
+    state_path, telemetry_path, artifact_dir = discover_observability_paths(
+        repo,
+        state_file_arg=args.state_file,
+        telemetry_file_arg=args.telemetry_file,
+        artifact_dir_arg=args.artifact_dir,
+    )
+    conv_id = (args.conversation_id or os.environ.get("PODO_CONVERSATION_ID", "")).strip()
+    transcript_path = Path(args.transcript_path).resolve() if args.transcript_path else None
+    out_path = Path(args.out).resolve() if args.out else None
+
+    snap, _ = write_session_snapshot(
+        cfg=cfg,
+        repo=repo,
+        state_path=state_path,
+        telemetry_path=telemetry_path,
+        conversation_id=conv_id,
+        transcript_path=transcript_path,
+        artifact_dir=artifact_dir,
+        out_path=out_path,
+        explicit_telemetry=explicit_tel,
+    )
+    print(json.dumps(snap, indent=2, ensure_ascii=False))
+    return 0
+
+
 def handle_hook_stop(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     """Enforce deterministic no-comments, dead-code, and codified checks on Antigravity Stop hook."""
+    t0 = time.monotonic()
     role = os.environ.get("PODO_ROLE", "").strip().lower()
     if role in READ_ONLY_ROLES:
         print("{}")
@@ -2020,8 +3468,13 @@ def handle_hook_stop(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
 
     file_filter: set[str] | None = None
     transcript_raw = payload.get("transcriptPath") or payload.get("transcript_path")
-    if isinstance(transcript_raw, str) and transcript_raw.strip():
-        turn_info = inspect_turn_transcript(Path(transcript_raw.strip()), repo)
+    transcript_path = (
+        Path(transcript_raw.strip()).resolve()
+        if isinstance(transcript_raw, str) and transcript_raw.strip()
+        else None
+    )
+    if transcript_path is not None:
+        turn_info = inspect_turn_transcript(transcript_path, repo)
         if turn_info is not None:
             saw_file_edit, saw_run_command, edited_files = turn_info
             if not saw_file_edit and not saw_run_command:
@@ -2047,6 +3500,48 @@ def handle_hook_stop(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         )
     )
     violations.extend(run_codified_checks(repo, cmd_timeout=8, deadline=deadline, file_filter=file_filter))
+
+    conv_id = str(payload.get("conversationId") or payload.get("conversation_id") or "").strip()
+    artifact_raw = payload.get("artifactDirectoryPath") or payload.get("artifact_directory_path") or ""
+    artifact_dir = (
+        Path(artifact_raw.strip()).resolve()
+        if isinstance(artifact_raw, str) and artifact_raw.strip()
+        else None
+    )
+    outcome = "pass" if not violations else ("observe" if mode == "observe" else "fail")
+    telemetry_target = resolve_telemetry_target(repo=repo)
+    emit_telemetry_event(
+        cfg,
+        telemetry_target,
+        "hook_stop",
+        conversation_id=conv_id,
+        phase=os.environ.get("PODO_PHASE", "").strip(),
+        worker=os.environ.get("PODO_WORKER", "").strip(),
+        role=role,
+        model=get_role_model(cfg, role),
+        gate=classify_violation_gate(violations),
+        result=outcome,
+        violation_count=len(violations),
+        files=extract_violation_files(violations, fallback_files=file_filter),
+        duration_ms=(time.monotonic() - t0) * 1000.0,
+    )
+
+    if (repo / ".podo").is_dir() or artifact_dir is not None:
+        explicit_tel = bool(os.environ.get("PODO_TELEMETRY_FILE", "").strip())
+        state_path, resolved_telemetry, resolved_artifact = discover_observability_paths(
+            repo,
+            artifact_dir_arg=str(artifact_dir) if artifact_dir else None,
+        )
+        write_session_snapshot(
+            cfg=cfg,
+            repo=repo,
+            state_path=state_path,
+            telemetry_path=telemetry_target if explicit_tel else (resolved_telemetry or telemetry_target),
+            conversation_id=conv_id,
+            transcript_path=transcript_path,
+            artifact_dir=resolved_artifact or artifact_dir,
+            explicit_telemetry=explicit_tel,
+        )
 
     if violations:
         if mode == "observe":
@@ -2090,6 +3585,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_check.add_argument("--files", help="Comma-separated repo-relative paths to scope checks to")
     p_check.add_argument("--mode", choices=("enforce", "observe"), default="enforce", help="Enforcement mode")
     p_check.add_argument("--run-verify", action="store_true", help="Also execute .podo/verify.sh if present")
+    p_check.add_argument("--telemetry-file", help="Optional JSONL telemetry output path")
+    p_check.add_argument("--phase", help="Optional phase identifier for telemetry attribution")
+    p_check.add_argument("--worker", help="Optional worker name for telemetry attribution")
+    p_check.add_argument("--role", help="Optional role name for telemetry attribution")
 
     p_codify = sub.add_parser("codify", help="Add a deterministic check to .podo/checks.json")
     p_codify.add_argument("--repo", default=".", help="Repository path")
@@ -2098,6 +3597,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_codify.add_argument("--glob", default="*", help="File glob for --regex")
     p_codify.add_argument("--cmd", help="Required shell command that must exit 0")
     p_codify.add_argument("--fix", required=True, help="Actionable remediation message")
+    p_codify.add_argument("--telemetry-file", help="Optional JSONL telemetry output path")
 
     p_dag = sub.add_parser("dag", help="Initialize or update live DAG state and artifacts")
     dag_sub = p_dag.add_subparsers(dest="dag_action", required=True)
@@ -2108,6 +3608,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dag_init.add_argument("--md-out")
     p_dag_init.add_argument("--html-out")
     p_dag_init.add_argument("--phases-json", required=True)
+    p_dag_init.add_argument("--repo")
+    p_dag_init.add_argument("--telemetry-file")
 
     p_dag_upd = dag_sub.add_parser("update")
     p_dag_upd.add_argument("--state-file", required=True)
@@ -2119,8 +3621,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_dag_upd.add_argument("--worker")
     p_dag_upd.add_argument("--model")
     p_dag_upd.add_argument("--note")
+    p_dag_upd.add_argument("--started-at")
+    p_dag_upd.add_argument("--finished-at")
     p_dag_upd.add_argument("--md-out")
     p_dag_upd.add_argument("--html-out")
+    p_dag_upd.add_argument("--repo")
+    p_dag_upd.add_argument("--telemetry-file")
+
+    p_tel = sub.add_parser("telemetry", help="Inspect observability metrics and generate session snapshots")
+    tel_sub = p_tel.add_subparsers(dest="telemetry_action", required=True)
+
+    p_tel_rep = tel_sub.add_parser("report", help="Render telemetry report from DAG and JSONL events")
+    p_tel_rep.add_argument("--repo", default=".", help="Repository path")
+    p_tel_rep.add_argument("--state-file", help="Path to podo-dag.state.json")
+    p_tel_rep.add_argument("--telemetry-file", help="Path to telemetry JSONL log")
+    p_tel_rep.add_argument("--json", action="store_true", help="Output report as JSON")
+
+    p_tel_snap = tel_sub.add_parser("snapshot", help="Write session snapshot and update trace-index.json")
+    p_tel_snap.add_argument("--repo", default=".", help="Repository path")
+    p_tel_snap.add_argument("--state-file", help="Path to podo-dag.state.json")
+    p_tel_snap.add_argument("--telemetry-file", help="Path to telemetry JSONL log")
+    p_tel_snap.add_argument("--conversation-id", help="Antigravity conversation ID")
+    p_tel_snap.add_argument("--transcript-path", help="Path to conversation transcript.jsonl")
+    p_tel_snap.add_argument("--artifact-dir", help="Antigravity artifact directory path")
+    p_tel_snap.add_argument("--out", help="Explicit output path for snapshot JSON")
 
     p_cfg = sub.add_parser("config", help="Inspect or update role models and gate modes")
     p_cfg.add_argument("--show", action="store_true")
@@ -2146,6 +3670,8 @@ def main() -> int:
         return cmd_codify(args)
     if args.command == "dag":
         return cmd_dag(args)
+    if args.command == "telemetry":
+        return cmd_telemetry(args)
     if args.command == "config":
         return cmd_config(args)
 

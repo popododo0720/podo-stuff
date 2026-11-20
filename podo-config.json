@@ -26,5 +26,21 @@
       "SAFETY:",
       "NOTE(popododo):"
     ]
+  },
+  "telemetry": {
+    "enabled": true,
+    "role_avg_tokens": {
+      "scout": 12000,
+      "builder": 28000,
+      "arena_a": 32000,
+      "arena_b": 32000,
+      "interrogator": 25000,
+      "monitor": 4000
+    },
+    "anomaly_thresholds": {
+      "interrogator_calls_per_phase_warn": 2.0,
+      "gate_fail_rate_warn": 0.35,
+      "interrogator_history_multiplier_warn": 2.0
+    }
   }
 }
