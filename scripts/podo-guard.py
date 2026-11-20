@@ -2527,21 +2527,25 @@ def render_dag_html(
                 else ""
             )
             dur_str = format_duration_s(node.get("duration_s"))
+            worker_disp = html.escape(node.get("worker") or "unassigned")
+            model_disp = html.escape(node.get("model") or "inherit")
             chips_row = f'<div class="chips">{deps_html}{files_html}</div>' if (deps_html or files_html) else ""
             node_cards.append(
                 f"""
                 <div class="node-card">
                   <div class="node-top">
                     <div class="min-w-0">
-                      <div class="node-id">{html.escape(node["id"])}</div>
+                      <div class="node-id mono">{html.escape(node["id"])}</div>
                       <div class="node-title">{html.escape(node["title"])}</div>
                     </div>
                     <span class="badge {st_cls}"><span class="dot"></span>{html.escape(st_label)}</span>
                   </div>
-                  <div class="node-meta">
-                    <span class="meta-pill meta-worker">@{html.escape(node.get("worker") or "unassigned")}</span>
-                    <span class="meta-pill mono">{html.escape(node.get("model") or "inherit")}</span>
-                    <span class="meta-pill mono">{html.escape(dur_str)}</span>
+                  <div class="node-meta-line">
+                    <span class="meta-worker mono">@{worker_disp}</span>
+                    <span class="meta-sep">·</span>
+                    <span>{html.escape(dur_str)}</span>
+                    <span class="meta-sep">·</span>
+                    <span class="mono">{model_disp}</span>
                   </div>
                   {chips_row}
                   {note_html}
@@ -2684,6 +2688,17 @@ def render_dag_html(
     else:
         anomalies_html = '<div class="alert-ok">No anomalies detected.</div>'
 
+    rejected_kpi_html = (
+        f"""
+        <div class="kpi-card">
+          <span class="kpi-label">Rejected</span>
+          <span class="kpi-val kpi-error">{rejected_nodes}</span>
+        </div>
+        """
+        if rejected_nodes > 0
+        else ""
+    )
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2691,18 +2706,18 @@ def render_dag_html(
   <title>Podo Swarm DAG — {html.escape(state["title"])}</title>
   <style>
     :root {{
-      --background: #0f1117;
-      --card: #161922;
-      --foreground: #e6e8ef;
-      --muted-foreground: #949dae;
-      --border: #272d3d;
-      --card-border: #222736;
-      --primary: #5b9cf6;
-      --secondary: #202636;
-      --secondary-foreground: #cfd6e6;
-      --success: #34d399;
-      --warning: #fbbf24;
-      --error: #f87171;
+      --background: #101013;
+      --card: #17171c;
+      --foreground: #f2f4f6;
+      --muted-foreground: #8b95a1;
+      --border: rgba(255, 255, 255, 0.06);
+      --card-border: rgba(255, 255, 255, 0.04);
+      --primary: #3182f6;
+      --secondary: #202027;
+      --secondary-foreground: #d1d6db;
+      --success: #15c47e;
+      --warning: #f59f00;
+      --error: #f04452;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -2710,19 +2725,20 @@ def render_dag_html(
       padding: 16px;
       background: var(--background);
       color: var(--foreground);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      line-height: 1.45;
+      font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Segoe UI", Roboto, sans-serif;
+      letter-spacing: -0.015em;
+      line-height: 1.5;
       -webkit-font-smoothing: antialiased;
     }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     .muted {{ color: var(--muted-foreground); }}
     .min-w-0 {{ min-width: 0; }}
-    .page {{ max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }}
+    .page {{ max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }}
     .header-card, .phase-card, .panel-card {{
       background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 16px;
+      border: none;
+      border-radius: 22px;
+      padding: 20px;
     }}
     .header-top {{
       display: flex;
@@ -2730,264 +2746,275 @@ def render_dag_html(
       align-items: flex-start;
       justify-content: space-between;
       gap: 10px;
-      padding-bottom: 12px;
-      border-bottom: 1px solid var(--card-border);
     }}
-    .eyebrow {{
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      color: var(--primary);
+    .page-title {{
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--foreground);
     }}
-    .page-title {{ margin: 4px 0 0; font-size: 17px; font-weight: 600; color: var(--foreground); }}
-    .subtitle {{ margin-top: 4px; font-size: 12px; color: var(--muted-foreground); }}
-    .kpi-grid {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 10px;
-      margin-top: 12px;
-    }}
-    .kpi-card {{
-      padding: 10px 12px;
-      border-radius: 10px;
-      background: var(--background);
-      border: 1px solid var(--card-border);
-      display: flex;
-      flex-direction: column;
-      gap: 3px;
-    }}
-    .kpi-label {{
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.05em;
-      text-transform: uppercase;
+    .subtitle {{
+      margin-top: 6px;
+      font-size: 12px;
       color: var(--muted-foreground);
     }}
-    .kpi-val {{ font-size: 16px; font-weight: 600; color: var(--foreground); }}
+    .kpi-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }}
+    .kpi-card {{
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: var(--secondary);
+      border: none;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }}
+    .kpi-label {{
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--muted-foreground);
+    }}
+    .kpi-val {{
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      font-variant-numeric: tabular-nums;
+      color: var(--foreground);
+    }}
     .kpi-primary {{ color: var(--primary); }}
     .kpi-success {{ color: var(--success); }}
     .kpi-error {{ color: var(--error); }}
-    .phase-card, .panel-card {{ display: flex; flex-direction: column; gap: 12px; }}
+    .phase-card, .panel-card {{ display: flex; flex-direction: column; gap: 14px; }}
     .phase-header, .panel-header {{
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      padding-bottom: 10px;
-      border-bottom: 1px solid var(--card-border);
     }}
     .phase-title-group, .gate-group {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }}
     .phase-id {{
-      padding: 2px 8px;
-      border-radius: 6px;
+      padding: 3px 9px;
+      border-radius: 8px;
       background: var(--secondary);
-      color: var(--secondary-foreground);
+      color: var(--muted-foreground);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 11px;
+      font-weight: 500;
     }}
-    .phase-name, .panel-title {{ margin: 0; font-size: 14px; font-weight: 600; color: var(--foreground); }}
+    .phase-name, .panel-title {{
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--foreground);
+    }}
     .dur-pill {{
-      padding: 2px 8px;
-      border-radius: 6px;
-      background: var(--secondary);
+      padding: 3px 9px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
       color: var(--secondary-foreground);
       font-size: 11px;
       font-weight: 600;
+      font-variant-numeric: tabular-nums;
     }}
     .nodes-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
       gap: 10px;
     }}
     .node-card {{
-      background: var(--background);
-      border: 1px solid var(--card-border);
-      border-radius: 10px;
-      padding: 12px;
+      background: var(--secondary);
+      border: none;
+      border-radius: 16px;
+      padding: 16px;
       display: flex;
       flex-direction: column;
       justify-content: space-between;
-      gap: 8px;
+      gap: 10px;
     }}
-    .node-top {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }}
-    .node-id {{
-      font-size: 11px;
-      color: var(--muted-foreground);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    }}
-    .node-title {{ font-size: 13px; font-weight: 500; color: var(--foreground); margin-top: 2px; }}
-    .node-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 11px; color: var(--muted-foreground); }}
-    .meta-pill {{
-      padding: 2px 6px;
-      border-radius: 5px;
-      background: var(--card);
-      border: 1px solid var(--card-border);
-    }}
-    .meta-worker {{
+    .node-top {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }}
+    .node-id {{ font-size: 11px; color: var(--muted-foreground); }}
+    .node-title {{
+      font-size: 14px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
       color: var(--foreground);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      margin-top: 3px;
+      line-height: 1.4;
     }}
-    .chips {{ display: flex; flex-wrap: wrap; gap: 4px; }}
+    .node-meta-line {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted-foreground);
+      font-variant-numeric: tabular-nums;
+    }}
+    .meta-worker {{ color: var(--secondary-foreground); font-weight: 500; }}
+    .meta-sep {{ opacity: 0.45; }}
+    .chips {{ display: flex; flex-wrap: wrap; gap: 6px; }}
     .chip {{
-      padding: 2px 6px;
-      border-radius: 4px;
+      padding: 3px 8px;
+      border-radius: 6px;
       font-size: 11px;
+      border: none;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }}
-    .chip-dep {{ background: var(--secondary); color: var(--secondary-foreground); }}
-    .chip-file {{ border: 1px solid var(--border); color: var(--muted-foreground); }}
+    .chip-dep {{ background: rgba(49, 130, 246, 0.14); color: var(--primary); }}
+    .chip-file {{ background: rgba(255, 255, 255, 0.04); color: var(--muted-foreground); }}
     .node-note {{ font-size: 12px; color: var(--muted-foreground); word-break: break-word; }}
     .gate-note {{
       font-size: 12px;
-      color: var(--muted-foreground);
-      padding: 8px 10px;
-      border-radius: 8px;
-      background: var(--background);
-      border: 1px solid var(--card-border);
+      color: var(--secondary-foreground);
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(49, 130, 246, 0.08);
+      border: none;
+      line-height: 1.5;
     }}
     .badge {{
       flex-shrink: 0;
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      padding: 2px 8px;
+      padding: 4px 10px;
       border-radius: 999px;
-      border: 1px solid var(--border);
+      border: none;
       font-size: 11px;
-      font-weight: 500;
+      font-weight: 600;
       color: var(--muted-foreground);
     }}
     .dot {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
-    .badge-pending {{ border-color: var(--border); color: var(--muted-foreground); }}
-    .badge-building {{ border-color: var(--primary); color: var(--primary); }}
-    .badge-script {{ border-color: var(--primary); color: var(--primary); }}
-    .badge-arena {{ border-color: var(--warning); color: var(--warning); }}
-    .badge-interrogating {{ border-color: var(--warning); color: var(--warning); }}
-    .badge-rejected {{ border-color: var(--error); color: var(--error); }}
-    .badge-verified {{ border-color: var(--success); color: var(--success); }}
+    .badge-pending {{ background: var(--card); color: var(--muted-foreground); }}
+    .badge-building, .badge-script {{ background: rgba(49, 130, 246, 0.14); color: var(--primary); }}
+    .badge-arena, .badge-interrogating {{ background: rgba(245, 159, 0, 0.14); color: var(--warning); }}
+    .badge-rejected {{ background: rgba(240, 68, 82, 0.14); color: var(--error); }}
+    .badge-verified {{ background: rgba(21, 196, 126, 0.14); color: var(--success); }}
     .gantt-ruler {{
       display: flex;
       justify-content: space-between;
-      font-size: 10px;
+      font-size: 11px;
       color: var(--muted-foreground);
       padding: 0 2px;
     }}
     .gantt-list {{ display: flex; flex-direction: column; gap: 10px; }}
     .gantt-item {{
-      background: var(--background);
-      border: 1px solid var(--card-border);
-      border-radius: 8px;
-      padding: 10px 12px;
+      background: var(--secondary);
+      border: none;
+      border-radius: 16px;
+      padding: 14px 16px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 9px;
     }}
-    .gantt-phase {{ border-left: 3px solid var(--primary); }}
-    .gantt-node {{ margin-left: 12px; }}
+    .gantt-phase {{ background: rgba(49, 130, 246, 0.09); border-left: none; }}
+    .gantt-node {{ margin-left: 0; }}
     .gantt-head {{
       display: flex;
       flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
-      font-size: 12px;
+      font-size: 13px;
     }}
     .gantt-title-wrap {{ display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 180px; }}
     .gantt-tag {{
       flex-shrink: 0;
-      padding: 2px 6px;
-      border-radius: 4px;
-      background: var(--secondary);
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.06);
       color: var(--secondary-foreground);
-      font-size: 10px;
+      font-size: 11px;
       font-weight: 600;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }}
-    .gantt-tag-phase {{ color: var(--primary); }}
-    .gantt-label {{ color: var(--foreground); font-weight: 500; word-break: break-word; }}
+    .gantt-tag-phase {{ background: rgba(49, 130, 246, 0.16); color: var(--primary); }}
+    .gantt-label {{ color: var(--foreground); font-weight: 600; word-break: break-word; }}
     .gantt-sub {{ font-size: 12px; line-height: 1.45; word-break: break-word; }}
     .gantt-meta {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
-    .gantt-range {{ font-size: 11px; white-space: nowrap; }}
+    .gantt-range {{ font-size: 11px; white-space: nowrap; font-variant-numeric: tabular-nums; }}
     .gantt-track {{
       position: relative;
       width: 100%;
-      height: 12px;
+      height: 8px;
       border-radius: 999px;
-      background-color: var(--card);
-      background-image: linear-gradient(
-        to right,
-        transparent 24.7%,
-        var(--border) 25%,
-        transparent 25.3%,
-        transparent 49.7%,
-        var(--border) 50%,
-        transparent 50.3%,
-        transparent 74.7%,
-        var(--border) 75%,
-        transparent 75.3%
-      );
-      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.06);
+      border: none;
       overflow: hidden;
     }}
     .gantt-bar {{
       position: absolute;
-      top: 1px;
-      bottom: 1px;
+      top: 0;
+      bottom: 0;
       border-radius: 999px;
-      opacity: 0.92;
+      opacity: 1;
     }}
     .gantt-bar-empty {{ height: 100%; }}
     .stats {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }}
     .stat-pill {{
-      padding: 5px 10px;
-      border-radius: 8px;
-      background: var(--background);
-      border: 1px solid var(--border);
+      padding: 6px 11px;
+      border-radius: 10px;
+      background: var(--secondary);
+      border: none;
     }}
-    .stat-value {{ font-weight: 600; margin-left: 4px; color: var(--foreground); }}
+    .stat-value {{
+      font-weight: 600;
+      margin-left: 4px;
+      color: var(--foreground);
+      font-variant-numeric: tabular-nums;
+    }}
     .stat-success {{ color: var(--success); }}
     .share-wrap {{ display: flex; flex-direction: column; gap: 8px; }}
     .share-bar {{
       display: flex;
       width: 100%;
-      height: 10px;
+      height: 8px;
       border-radius: 999px;
       overflow: hidden;
-      background: var(--background);
-      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.06);
+      border: none;
       gap: 2px;
     }}
-    .share-seg {{ height: 100%; }}
-    .share-legend {{ display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; }}
-    .legend-chip {{ display: inline-flex; align-items: center; gap: 5px; }}
+    .share-seg {{ height: 100%; border-radius: 999px; }}
+    .share-legend {{ display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; }}
+    .legend-chip {{ display: inline-flex; align-items: center; gap: 6px; }}
     .legend-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
-    .obs-stack {{ display: flex; flex-direction: column; gap: 12px; }}
+    .obs-stack {{ display: flex; flex-direction: column; gap: 14px; }}
     .obs-table-wrap {{ width: 100%; overflow-x: auto; }}
     .obs-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
     .obs-table th, .obs-table td {{
       text-align: left;
-      padding: 7px 8px;
+      padding: 10px 8px;
       border-bottom: 1px solid var(--card-border);
     }}
+    .obs-table tbody tr:last-child td {{ border-bottom: none; }}
     .obs-table th.num, .obs-table td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
     .obs-table th {{ color: var(--muted-foreground); font-weight: 500; font-size: 11px; }}
     .alert-item {{
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--warning);
-      background: var(--background);
+      padding: 13px 16px;
+      border-radius: 14px;
+      border: none;
+      background: rgba(245, 159, 0, 0.12);
       color: var(--warning);
       font-size: 12px;
+      line-height: 1.5;
       margin-bottom: 6px;
     }}
     .alert-ok {{
-      padding: 10px 12px;
-      border-radius: 8px;
-      border: 1px solid var(--success);
-      background: var(--background);
+      padding: 13px 16px;
+      border-radius: 14px;
+      border: none;
+      background: rgba(21, 196, 126, 0.12);
       color: var(--success);
       font-size: 12px;
+      line-height: 1.5;
     }}
   </style>
 </head>
@@ -2996,35 +3023,31 @@ def render_dag_html(
     <header class="header-card">
       <div class="header-top">
         <div>
-          <div class="eyebrow mono">PODO-STUFF · PHASED DAG ORCHESTRATOR</div>
           <h1 class="page-title">{html.escape(state["title"])}</h1>
           <div class="subtitle">
-            Tier 1: Per-Task Deterministic Script (0 tokens) · Tier 2: Per-Phase Interrogator Gate ({html.escape(interrogator_model)})
+            Tier 1: Deterministic Guard · Tier 2: Interrogator Gate ({html.escape(interrogator_model)})
           </div>
         </div>
         <div class="muted mono" style="font-size:11px;">Updated {html.escape(state["updated_at"])}</div>
       </div>
       <div class="kpi-grid">
         <div class="kpi-card">
-          <span class="kpi-label">Tasks Verified</span>
-          <span class="kpi-val mono">{verified_nodes}/{total_nodes}</span>
+          <span class="kpi-label">Verified</span>
+          <span class="kpi-val">{verified_nodes}/{total_nodes}</span>
         </div>
         <div class="kpi-card">
-          <span class="kpi-label">Total Duration</span>
-          <span class="kpi-val kpi-primary mono">{html.escape(total_duration_label)}</span>
+          <span class="kpi-label">Duration</span>
+          <span class="kpi-val kpi-primary">{html.escape(total_duration_label)}</span>
         </div>
         <div class="kpi-card">
-          <span class="kpi-label">Estimated Tokens</span>
-          <span class="kpi-val mono">{total_estimated:,}</span>
+          <span class="kpi-label">Est. Tokens</span>
+          <span class="kpi-val">{total_estimated:,}</span>
         </div>
         <div class="kpi-card">
           <span class="kpi-label">Tier-1 Saved</span>
-          <span class="kpi-val kpi-success mono">{tier1_saved:,}</span>
+          <span class="kpi-val kpi-success">{tier1_saved:,}</span>
         </div>
-        <div class="kpi-card">
-          <span class="kpi-label">Rejected</span>
-          <span class="kpi-val kpi-error mono">{rejected_nodes}</span>
-        </div>
+        {rejected_kpi_html}
       </div>
     </header>
     <main class="page">
