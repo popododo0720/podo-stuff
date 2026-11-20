@@ -51,6 +51,7 @@
     "arena_threshold": 0.7,
     "complexity_min_for_swarm": 2.2,
     "clarification_threshold": 0.9,
+    "boundary_plan_threshold": 0.75,
     "show_banner": true,
     "timeout_s": 5
   }

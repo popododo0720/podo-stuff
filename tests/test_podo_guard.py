@@ -1795,10 +1795,10 @@ class AutopilotRouterTests(unittest.TestCase):
 
             ambig_resp = {
                 "answers": {
-                    "mode": {"winning_option": "swarm", "confidence": 0.82},
+                    "mode": {"winning_option": "swarm", "confidence": 0.52},
                     "needs_arena": {"noul": 0.1},
-                    "complexity": {"score": 3.2},
-                    "needs_clarification": {"noul": 0.94},
+                    "complexity": {"score": 3.5},
+                    "needs_clarification": {"noul": 0.96},
                 }
             }
             rc_amb, out_amb, _ = self._run_pre_invocation(
@@ -1809,7 +1809,29 @@ class AutopilotRouterTests(unittest.TestCase):
             )
             self.assertEqual(rc_amb, 0)
             self.assertIn("Podo Autopilot · Clarify", out_amb["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
-            self.assertIn("Do NOT spawn swarm workers yet", out_amb["injectSteps"][0]["systemMessage"]["systemMessage"])
+            self.assertIn("Do NOT spawn swarm workers", out_amb["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            boundary_resp = {
+                "answers": {
+                    "mode": {
+                        "winning_option": "swarm",
+                        "confidence": 0.52,
+                        "probabilities": {"swarm": 0.52, "plan": 0.41, "direct": 0.05, "grill": 0.02},
+                    },
+                    "needs_arena": {"noul": 0.2},
+                    "complexity": {"score": 3.1},
+                    "needs_clarification": {"noul": 0.25},
+                }
+            }
+            rc_bnd, out_bnd, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "결제 모듈 MSA 분리해줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=boundary_resp,
+            )
+            self.assertEqual(rc_bnd, 0)
+            self.assertIn("Podo Autopilot · Plan", out_bnd["injectSteps"][0]["systemMessage"]["metadata"]["user_markdown"])
+            self.assertIn("swarm/plan boundary", out_bnd["injectSteps"][0]["systemMessage"]["systemMessage"])
 
 
 if __name__ == "__main__":

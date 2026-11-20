@@ -112,12 +112,12 @@
   {
     "id": "ambiguous-ko-1",
     "input": "우리 앱 성능이랑 구조 좀 싹 다 좋게 고쳐줘",
-    "expected": ["clarify", "plan", "direct"]
+    "expected": ["clarify"]
   },
   {
     "id": "ambiguous-en-1",
     "input": "Make the whole backend better and add whatever features are missing",
-    "expected": ["clarify", "plan", "direct"]
+    "expected": ["clarify"]
   },
   {
     "id": "direct-ko-explain-code",

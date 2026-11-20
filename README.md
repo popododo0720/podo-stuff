@@ -2,7 +2,7 @@
 
 My personal agent harness for Google Antigravity.
 
-Auto-routes prompts to the right workflow, orchestrates parallel DAG swarms, and blocks sloppy code with zero-token gates before it lands.
+Auto-routes prompts to the right workflow, orchestrates parallel swarms, and blocks sloppy code before it lands.
 
 ## Install
 
@@ -19,9 +19,9 @@ cd podo-stuff && ./install.sh
 
 ## What's Inside
 
-- **Autopilot Router (`PreInvocation`)** — routes each turn via `gemini-decision-1` (0 output tokens) into `direct`, `swarm`, `plan`, `grill`, or `clarify`, with per-turn dedup, complexity gating, and session mode stickiness.
+- **Autopilot Router (`PreInvocation`)** — routes each turn via `gemini-decision-1` into `direct`, `swarm`, `plan`, `grill`, or `clarify`, with per-turn dedup, complexity/ambiguity gating, and session mode stickiness.
 - **Phased Swarm (`/podo-swarm`)** — breaks multi-file tasks into disjoint parallel DAG phases on top of native Antigravity `/swarm`, with optional dual-model Arena bake-offs and one context-isolated `interrogator` pass per phase.
-- **Zero-Token Code Gate (`Stop`)** — catches inline narration comments, Python AST dead code, and repo-level `.podo/checks.json` rules scoped strictly to the files edited in that turn.
+- **Code Gate (`Stop`)** — catches inline narration comments, Python AST dead code, and repo-level `.podo/checks.json` rules scoped strictly to the files edited in that turn.
 - **Offline Observability** — local JSONL telemetry, offline Gantt DAG dashboard (`podo-dag.html`), and role-based token estimates with zero external services.
 
 ## Usage

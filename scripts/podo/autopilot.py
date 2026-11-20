@@ -26,6 +26,7 @@ DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "arena_threshold": 0.70,
     "complexity_min_for_swarm": 2.2,
     "clarification_threshold": 0.90,
+    "boundary_plan_threshold": 0.75,
     "show_banner": True,
     "timeout_s": 5,
 }
@@ -122,6 +123,8 @@ def get_autopilot_config(cfg: dict[str, Any]) -> dict[str, Any]:
             merged["complexity_min_for_swarm"] = max(0.0, min(4.0, float(raw["complexity_min_for_swarm"])))
         if isinstance(raw.get("clarification_threshold"), (int, float)):
             merged["clarification_threshold"] = max(0.0, min(1.0, float(raw["clarification_threshold"])))
+        if isinstance(raw.get("boundary_plan_threshold"), (int, float)):
+            merged["boundary_plan_threshold"] = max(0.0, min(1.0, float(raw["boundary_plan_threshold"])))
         if "show_banner" in raw:
             merged["show_banner"] = bool(raw["show_banner"])
         if isinstance(raw.get("timeout_s"), (int, float)) and raw["timeout_s"] > 0:
@@ -355,78 +358,118 @@ def call_decisions_api(
     return parse_decisions_response(parsed)
 
 
+def evaluate_autopilot_decision_detailed(
+    decision: dict[str, Any],
+    autopilot_cfg: dict[str, Any],
+    plugin_root: Path = PLUGIN_ROOT,
+) -> tuple[str, str, dict[str, Any]]:
+    """Resolve (effective_mode, route_reason, injectSteps_payload) via the 5-state decision matrix."""
+    mode = str(decision.get("mode") or "direct")
+    confidence = float(decision.get("confidence") or 0.0)
+    probs = decision.get("probabilities") if isinstance(decision.get("probabilities"), dict) else {}
+    threshold = float(autopilot_cfg.get("confidence_threshold", 0.65))
+    arena_threshold = float(autopilot_cfg.get("arena_threshold", 0.70))
+    complexity_min = float(autopilot_cfg.get("complexity_min_for_swarm", 2.2))
+    clarification_threshold = float(autopilot_cfg.get("clarification_threshold", 0.90))
+    boundary_plan_threshold = float(autopilot_cfg.get("boundary_plan_threshold", 0.75))
+    needs_arena = float(decision.get("needs_arena_prob") or 0.0) >= arena_threshold
+    complexity_score = decision.get("complexity_score")
+    clarification_prob = decision.get("needs_clarification_prob")
+    show_banner = bool(autopilot_cfg.get("show_banner", True))
+
+    is_complex = isinstance(complexity_score, (int, float)) and float(complexity_score) >= complexity_min
+    is_low_complexity = isinstance(complexity_score, (int, float)) and float(complexity_score) < complexity_min
+    is_high_ambiguity = (
+        isinstance(clarification_prob, (int, float)) and float(clarification_prob) >= clarification_threshold
+    )
+
+    if is_complex and is_high_ambiguity:
+        clar_pct = f"{float(clarification_prob):.0%}"
+        banner = (
+            f"🧭 **[Podo Autopilot · Clarify]** 규모가 큰 요청이지만 스펙이 모호해 핵심 확인 질문을 먼저 드립니다. "
+            f"*(모호도 {clar_pct} · 복잡도 {float(complexity_score):.1f}/4)*"
+        )
+        directive = (
+            f"[Podo Autopilot Router] gemini-decision-1 flagged a complex but underspecified request "
+            f"(complexity={float(complexity_score):.2f}, needs_clarification={float(clarification_prob):.2f}). "
+            "Do NOT spawn swarm workers or edit code yet; ask 1-3 concise clarifying questions to lock down scope, target modules, and constraints first."
+        )
+        sys_msg: dict[str, Any] = {"systemMessage": directive}
+        if show_banner:
+            sys_msg["metadata"] = {"user_markdown": banner}
+        return "clarify", "high_ambiguity_clarify", {"injectSteps": [{"systemMessage": sys_msg}]}
+
+    if mode != "direct" and confidence >= threshold:
+        conf_pct = f"{confidence:.0%}"
+        if mode == "swarm":
+            if is_low_complexity:
+                return "direct", "low_complexity_downgrade", {}
+            arena_note = " · Arena 권장" if needs_arena else ""
+            arena_directive = (
+                " The decision model also flagged high architectural risk (`needs_arena=true`), so consider dual-model Arena competition for the core module."
+                if needs_arena
+                else ""
+            )
+            swarm_skill_path = plugin_root / "skills" / "podo-swarm" / "SKILL.md"
+            banner = f"🐝 **[Podo Autopilot · Swarm]** 대규모 구현 작업으로 판단되어 `podo-swarm` 파이프라인으로 자동 실행합니다. *(신뢰도 {conf_pct}{arena_note})*"
+            directive = (
+                f"[Podo Autopilot Router] gemini-decision-1 classified this request as SWARM (confidence={conf_pct}). "
+                f"Do NOT ask the user to type /podo-swarm; immediately read {swarm_skill_path} and execute the phased parallel podo-swarm workflow using the configured role models in podo-config.json."
+                + arena_directive
+            )
+            effective_mode = "swarm"
+        elif mode == "grill":
+            banner = f"🔥 **[Podo Autopilot · Grill]** 엄격한 코드·설계 검증 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
+            directive = (
+                f"[Podo Autopilot Router] gemini-decision-1 classified this request as GRILL (confidence={conf_pct}). "
+                "Act as an adversarial senior reviewer: scrutinize security holes, race conditions, hidden assumptions, edge cases, and architectural flaws before proposing fixes."
+            )
+            effective_mode = "grill"
+        else:
+            banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
+            directive = (
+                f"[Podo Autopilot Router] gemini-decision-1 classified this request as PLAN (confidence={conf_pct}). "
+                "Present a concise architecture design, key trade-offs, and a concrete step-by-step execution plan before making code edits."
+            )
+            effective_mode = "plan"
+
+        sys_msg = {"systemMessage": directive}
+        if show_banner:
+            sys_msg["metadata"] = {"user_markdown": banner}
+        return effective_mode, "confident_mode", {"injectSteps": [{"systemMessage": sys_msg}]}
+
+    swarm_plan_mass = float(probs.get("swarm") or 0.0) + float(probs.get("plan") or 0.0)
+    if is_complex and swarm_plan_mass >= boundary_plan_threshold:
+        mass_pct = f"{swarm_plan_mass:.0%}"
+        banner = (
+            f"🏗️ **[Podo Autopilot · Plan]** 규모가 큰 작업이지만 바로 구현/설계 경계선이라 실행 계획을 먼저 제안합니다. "
+            f"*(설계+구현 확률 {mass_pct})*"
+        )
+        directive = (
+            f"[Podo Autopilot Router] gemini-decision-1 saw a complex task on the swarm/plan boundary "
+            f"(P(swarm)+P(plan)={mass_pct}, complexity={float(complexity_score):.2f}). "
+            "Present a concise architecture and step-by-step execution plan first so the user can approve before spawning parallel workers."
+        )
+        sys_msg = {"systemMessage": directive}
+        if show_banner:
+            sys_msg["metadata"] = {"user_markdown": banner}
+        return "plan", "complex_boundary_plan", {"injectSteps": [{"systemMessage": sys_msg}]}
+
+    return "direct", "direct_default", {}
+
+
 def evaluate_autopilot_decision(
     decision: dict[str, Any],
     autopilot_cfg: dict[str, Any],
     plugin_root: Path = PLUGIN_ROOT,
 ) -> tuple[str, dict[str, Any]]:
     """Resolve effective mode and Antigravity PreInvocation injectSteps payload from a decision."""
-    mode = str(decision.get("mode") or "direct")
-    confidence = float(decision.get("confidence") or 0.0)
-    threshold = float(autopilot_cfg.get("confidence_threshold", 0.65))
-    arena_threshold = float(autopilot_cfg.get("arena_threshold", 0.70))
-    complexity_min = float(autopilot_cfg.get("complexity_min_for_swarm", 2.2))
-    clarification_threshold = float(autopilot_cfg.get("clarification_threshold", 0.90))
-    needs_arena = float(decision.get("needs_arena_prob") or 0.0) >= arena_threshold
-    complexity_score = decision.get("complexity_score")
-    clarification_prob = decision.get("needs_clarification_prob")
-    show_banner = bool(autopilot_cfg.get("show_banner", True))
-
-    if mode == "direct" or confidence < threshold:
-        return "direct", {}
-
-    conf_pct = f"{confidence:.0%}"
-    if mode == "swarm":
-        if isinstance(complexity_score, (int, float)) and float(complexity_score) < complexity_min:
-            return "direct", {}
-        if isinstance(clarification_prob, (int, float)) and float(clarification_prob) >= clarification_threshold:
-            banner = (
-                f"🧭 **[Podo Autopilot · Clarify]** 요구사항이 모호해 스웜 실행 전 핵심 확인 질문을 먼저 드립니다. "
-                f"*(신뢰도 {conf_pct} · 모호도 {float(clarification_prob):.0%})*"
-            )
-            directive = (
-                f"[Podo Autopilot Router] gemini-decision-1 classified this request as SWARM (confidence={conf_pct}), "
-                f"but flagged high ambiguity (needs_clarification={float(clarification_prob):.2f}). "
-                "Do NOT spawn swarm workers yet; ask 1-3 concise clarifying questions to lock down scope and constraints before implementing."
-            )
-            sys_msg: dict[str, Any] = {"systemMessage": directive}
-            if show_banner:
-                sys_msg["metadata"] = {"user_markdown": banner}
-            return "clarify", {"injectSteps": [{"systemMessage": sys_msg}]}
-
-        arena_note = " · Arena 권장" if needs_arena else ""
-        arena_directive = (
-            " The decision model also flagged high architectural risk (`needs_arena=true`), so consider dual-model Arena competition for the core module."
-            if needs_arena
-            else ""
-        )
-        swarm_skill_path = plugin_root / "skills" / "podo-swarm" / "SKILL.md"
-        banner = f"🐝 **[Podo Autopilot · Swarm]** 대규모 구현 작업으로 판단되어 `podo-swarm` 파이프라인으로 자동 실행합니다. *(신뢰도 {conf_pct}{arena_note})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as SWARM (confidence={conf_pct}). "
-            f"Do NOT ask the user to type /podo-swarm; immediately read {swarm_skill_path} and execute the phased parallel podo-swarm workflow using the configured role models in podo-config.json."
-            + arena_directive
-        )
-        effective_mode = "swarm"
-    elif mode == "grill":
-        banner = f"🔥 **[Podo Autopilot · Grill]** 엄격한 코드·설계 검증 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as GRILL (confidence={conf_pct}). "
-            "Act as an adversarial senior reviewer: scrutinize security holes, race conditions, hidden assumptions, edge cases, and architectural flaws before proposing fixes."
-        )
-        effective_mode = "grill"
-    else:
-        banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
-        directive = (
-            f"[Podo Autopilot Router] gemini-decision-1 classified this request as PLAN (confidence={conf_pct}). "
-            "Present a concise architecture design, key trade-offs, and a concrete step-by-step execution plan before making code edits."
-        )
-        effective_mode = "plan"
-
-    sys_msg = {"systemMessage": directive}
-    if show_banner:
-        sys_msg["metadata"] = {"user_markdown": banner}
-    return effective_mode, {"injectSteps": [{"systemMessage": sys_msg}]}
+    effective_mode, _, response_obj = evaluate_autopilot_decision_detailed(
+        decision,
+        autopilot_cfg,
+        plugin_root=plugin_root,
+    )
+    return effective_mode, response_obj
 
 
 def build_autopilot_injection(
@@ -462,6 +505,7 @@ def emit_autopilot_telemetry(
     model: str,
     decision: dict[str, Any],
     effective_mode: str,
+    route_reason: str,
     previous_mode: str,
     injected: bool,
     duration_ms: float,
@@ -480,6 +524,7 @@ def emit_autopilot_telemetry(
         "model": model,
         "gate": "autopilot-router",
         "result": effective_mode,
+        "route_reason": route_reason,
         "raw_mode": str(decision.get("mode") or "direct"),
         "confidence": decision.get("confidence", 0.0),
         "probabilities": decision.get("probabilities", {}),
@@ -599,7 +644,7 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         print("{}")
         return 0
 
-    effective_mode, response_obj = evaluate_autopilot_decision(
+    effective_mode, route_reason, response_obj = evaluate_autopilot_decision_detailed(
         decision,
         ap_cfg,
         plugin_root=config_path.parent,
@@ -611,6 +656,7 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
                 "conversation_id": conv_id,
                 "last_turn_key": turn_key,
                 "active_mode": effective_mode,
+                "route_reason": route_reason,
                 "raw_mode": decision.get("mode", "direct"),
                 "updated_at": utc_now_iso(),
             },
@@ -626,6 +672,7 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         model=str(ap_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"]),
         decision=decision,
         effective_mode=effective_mode,
+        route_reason=route_reason,
         previous_mode=previous_mode,
         injected=bool(response_obj),
         duration_ms=(time.monotonic() - t0) * 1000.0,

@@ -19,7 +19,7 @@ from podo.autopilot import (
     PLUGIN_ROOT,
     build_router_prompt,
     call_decisions_api,
-    evaluate_autopilot_decision,
+    evaluate_autopilot_decision_detailed,
     get_autopilot_config,
     load_json_dict,
     resolve_gemini_api_key,
@@ -63,10 +63,15 @@ def evaluate_golden_dataset(
 
         if decision is None:
             effective_mode = "error"
+            route_reason = "api_error"
             arena_ok = False
             cont_ok = False
         else:
-            effective_mode, _ = evaluate_autopilot_decision(decision, ap_cfg, plugin_root=config_path.parent)
+            effective_mode, route_reason, _ = evaluate_autopilot_decision_detailed(
+                decision,
+                ap_cfg,
+                plugin_root=config_path.parent,
+            )
             arena_prob = float(decision.get("needs_arena_prob") or 0.0)
             arena_thresh = float(ap_cfg.get("arena_threshold", 0.70))
             arena_ok = True if expect_arena is None else ((arena_prob >= arena_thresh) == bool(expect_arena))
@@ -92,6 +97,7 @@ def evaluate_golden_dataset(
                 "ok": ok,
                 "expected": expected_modes,
                 "actual": effective_mode,
+                "route_reason": route_reason,
                 "raw_mode": decision.get("mode") if decision else None,
                 "confidence": decision.get("confidence") if decision else None,
                 "complexity_score": decision.get("complexity_score") if decision else None,
@@ -140,11 +146,10 @@ def main() -> int:
     for row in report["cases"]:
         mark = "PASS" if row["ok"] else "FAIL"
         print(
-            f"[{mark}] {row['id']:30s} expected={','.join(row['expected']):18s} "
-            f"actual={row['actual']:8s} raw={str(row['raw_mode']):6s} "
-            f"conf={row['confidence']} comp={row['complexity_score']} "
-            f"clar={row['needs_clarification_prob']} cont={row['continues_previous_task_prob']} "
-            f"arena={row['needs_arena_prob']} ({row['duration_ms']:.0f}ms)"
+            f"[{mark}] {row['id']:30s} expected={','.join(row['expected']):14s} "
+            f"actual={row['actual']:8s} reason={row['route_reason']:24s} "
+            f"raw={str(row['raw_mode']):6s} conf={row['confidence']} comp={row['complexity_score']} "
+            f"clar={row['needs_clarification_prob']} cont={row['continues_previous_task_prob']} ({row['duration_ms']:.0f}ms)"
         )
     print("Confusion:", json.dumps(report["confusion"], ensure_ascii=False))
     return 0 if report["failed"] == 0 else 1
