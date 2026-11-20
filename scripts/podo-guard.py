@@ -170,35 +170,40 @@ def strip_comment_marker(comment_text: str) -> str:
     return text
 
 
-def is_allowed_comment(raw_comment: str, allow_tags: tuple[str, ...], allow_bare_header: bool = False) -> tuple[bool, str]:
-    """Return whether a comment is structurally permitted and why if rejected."""
+def is_allowed_comment(
+    raw_comment: str,
+    allow_tags: tuple[str, ...],
+    allow_bare_header: bool = False,
+) -> tuple[bool, str, bool]:
+    """Return (allowed, rejection_reason, always_block) for a comment."""
     stripped = raw_comment.strip()
     for prefix in DIRECTIVE_PREFIXES:
         if stripped.startswith(prefix):
-            return True, ""
+            return True, "", False
 
     body = strip_comment_marker(stripped)
     if not body:
-        return True, ""
+        return True, "", False
 
     if BARE_TODO_RE.search(body) and not TRACKED_REF_RE.search(body):
-        return False, "Untracked TODO/FIXME slop (link an issue/PR or resolve now)"
+        return False, "Untracked TODO/FIXME placeholder (link an issue/PR or resolve now)", True
 
     for pattern in DEAD_CODE_PATTERNS:
         if pattern.search(body):
-            return False, "Commented-out code detected; delete dead code instead of commenting it out"
+            return False, "Commented-out code detected; delete dead code instead of commenting it out", True
 
     for tag in allow_tags:
         if body.startswith(tag):
-            return True, ""
+            return True, "", False
 
     if allow_bare_header:
-        return True, ""
+        return True, "", False
 
     return (
         False,
         "Remove inline narration comment or prefix non-obvious constraint with "
         + " / ".join(f"'{t}'" for t in allow_tags[:3]),
+        False,
     )
 
 
@@ -278,7 +283,7 @@ def check_python_comments(
     full_source: str | None,
     allow_tags: tuple[str, ...],
 ) -> list[str]:
-    """Check added Python lines for forbidden narration or slop comments."""
+    """Check added Python lines for forbidden narration or placeholder comments."""
     violations: list[str] = []
     if full_source is not None:
         func_ranges = python_function_ranges(full_source)
@@ -320,8 +325,12 @@ def check_python_comments(
                 else is_indented
             )
             in_header = tok_line <= header_end and not is_indented
-            ok, reason = is_allowed_comment(tok.string, allow_tags, allow_bare_header=(in_header and not in_function))
-            if not ok and (in_function or is_indented or "slop" in reason.lower() or "dead code" in reason.lower()):
+            ok, reason, always_block = is_allowed_comment(
+                tok.string,
+                allow_tags,
+                allow_bare_header=(in_header and not in_function),
+            )
+            if not ok and (in_function or is_indented or always_block):
                 violations.append(f"[NO-COMMENTS] {rel_path}:{actual_line}: {tok.string.strip()} -> {reason}")
         return violations
 
@@ -330,8 +339,8 @@ def check_python_comments(
         if not stripped.startswith("#"):
             continue
         is_indented = len(text) > len(stripped)
-        ok, reason = is_allowed_comment(stripped, allow_tags, allow_bare_header=not is_indented)
-        if not ok and (is_indented or "slop" in reason.lower() or "dead code" in reason.lower()):
+        ok, reason, always_block = is_allowed_comment(stripped, allow_tags, allow_bare_header=not is_indented)
+        if not ok and (is_indented or always_block):
             violations.append(f"[NO-COMMENTS] {rel_path}:{line_no}: {stripped} -> {reason}")
     return violations
 
@@ -443,15 +452,19 @@ def check_brace_comments(
     full_source: str | None,
     allow_tags: tuple[str, ...],
 ) -> list[str]:
-    """Check added brace-language lines for forbidden inline narration or slop comments."""
+    """Check added brace-language lines for forbidden inline narration or placeholder comments."""
     violations: list[str] = []
     if full_source is not None:
         scanned = scan_brace_language_comments(full_source)
         for line_no, comment_text, depth, is_header in scanned:
             if line_no not in added_lines:
                 continue
-            ok, reason = is_allowed_comment(comment_text, allow_tags, allow_bare_header=(is_header and depth == 0))
-            if not ok and (depth >= 1 or "slop" in reason.lower() or "dead code" in reason.lower()):
+            ok, reason, always_block = is_allowed_comment(
+                comment_text,
+                allow_tags,
+                allow_bare_header=(is_header and depth == 0),
+            )
+            if not ok and (depth >= 1 or always_block):
                 violations.append(f"[NO-COMMENTS] {rel_path}:{line_no}: {comment_text.strip()} -> {reason}")
         return violations
 
@@ -461,8 +474,8 @@ def check_brace_comments(
         is_indented = len(text) > len(text.lstrip(" \t"))
         if stripped.startswith("//") or stripped.startswith("/*"):
             in_body = depth >= 1 or is_indented
-            ok, reason = is_allowed_comment(stripped, allow_tags, allow_bare_header=not in_body)
-            if not ok and (in_body or "slop" in reason.lower() or "dead code" in reason.lower()):
+            ok, reason, always_block = is_allowed_comment(stripped, allow_tags, allow_bare_header=not in_body)
+            if not ok and (in_body or always_block):
                 violations.append(f"[NO-COMMENTS] {rel_path}:{line_no}: {stripped} -> {reason}")
         depth = max(0, depth + text.count("{") - text.count("}"))
     return violations
@@ -473,15 +486,15 @@ def check_shell_comments(
     added_lines: dict[int, str],
     allow_tags: tuple[str, ...],
 ) -> list[str]:
-    """Check added shell lines for forbidden indented narration or slop comments."""
+    """Check added shell lines for forbidden indented narration or placeholder comments."""
     violations: list[str] = []
     for line_no, text in sorted(added_lines.items()):
         stripped = text.lstrip(" \t")
         if not stripped.startswith("#"):
             continue
         is_indented = len(text) > len(stripped)
-        ok, reason = is_allowed_comment(stripped, allow_tags, allow_bare_header=not is_indented)
-        if not ok and (is_indented or "slop" in reason.lower() or "dead code" in reason.lower()):
+        ok, reason, always_block = is_allowed_comment(stripped, allow_tags, allow_bare_header=not is_indented)
+        if not ok and (is_indented or always_block):
             violations.append(f"[NO-COMMENTS] {rel_path}:{line_no}: {stripped} -> {reason}")
     return violations
 
@@ -715,7 +728,7 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_codify(args: argparse.Namespace) -> int:
-    """Record a deterministic rule in <repo>/.podo/checks.json (encode-lessons-in-structure)."""
+    """Record a deterministic structural check in <repo>/.podo/checks.json."""
     if not args.regex and not args.cmd:
         print("Error: specify either --regex or --cmd", file=sys.stderr)
         return 2
@@ -942,7 +955,7 @@ def render_dag_html(state: dict[str, Any]) -> str:
 <body class="bg-[var(--background)] text-[var(--foreground)] antialiased p-4 md:p-6 space-y-4">
   <header class="rounded-xl bg-[var(--card)] border border-[var(--border)] p-4 flex flex-wrap items-center justify-between gap-4">
     <div>
-      <div class="text-xs font-mono text-[var(--primary)]">PODO-STUFF · pstack + OmO DAG</div>
+      <div class="text-xs font-mono text-[var(--primary)]">PODO-STUFF · PHASED DAG ORCHESTRATOR</div>
       <h1 class="text-lg font-semibold text-[var(--foreground)] mt-0.5">{html.escape(state["title"])}</h1>
       <div class="text-xs text-[var(--muted-foreground)] mt-1">
         Tier 1: Per-Task Deterministic Script (0 tokens) · Tier 2: Per-Phase Claude Opus 5.5 Batch Interrogator

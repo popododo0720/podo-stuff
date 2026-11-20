@@ -1,6 +1,6 @@
 # podo-stuff
 
-`pstack` structural discipline + `OmO` task-dependency DAG orchestration built as a zero-core-modification add-on plugin for Google Antigravity (`popododo`).
+Deterministic structural guardrails and phased task-dependency DAG orchestration built as a standalone add-on plugin for Google Antigravity.
 
 ## Features
 
@@ -13,7 +13,7 @@
 - **Two-Tier Verification Cadence (`/podo-swarm`)**:
   1. **Tier 1 — Per-Task Deterministic Gate (0 LLM tokens)**: `scripts/podo-guard.py check` + `Stop` hook runs after every `Orchestrator (Neon)` task. Blocks inline narration comments inside function bodies (`no-comments`), runs `.podo/checks.json` structural rules, and runs `.podo/verify.sh` / CI / tests.
   2. **Tier 2 — Per-DAG-Phase Batch Interrogator**: `Claude Opus 5.5 (Medium)` runs **once per DAG Phase (Wave) boundary** after all parallel builders in that Phase pass Tier 1.
-- **Encode Lessons in Structure (`podo-guard.py codify`)**:
+- **Persistent Structural Checks (`podo-guard.py codify`)**:
   - Converts recurring failures into permanent deterministic rules in `.podo/checks.json` (regex checks or required commands such as linters, typecheckers, or `specs/*.tla` TLC model checks).
 - **Live Task DAG Dashboard (`podo-dag.html` & `podo-dag.md`)**:
   - Tracks Phase-by-Phase parallel execution, worker/model assignments, per-task script gates, and per-phase Opus Interrogator status.

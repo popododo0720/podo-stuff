@@ -1,14 +1,14 @@
 ---
 name: podo-swarm
 description: >-
-  Run popododo's pstack + OmO DAG swarm orchestration on top of native Antigravity
+  Run phased parallel DAG swarm orchestration on top of native Antigravity
   /swarm without modifying built-in swarm internals. Automatically decomposes work
   into maximum-parallel DAG phases, runs zero-token deterministic checks per task,
   batches Claude Opus 5.5 (Medium) interrogation strictly once per DAG phase boundary,
   supports Neon vs Opus Arena bake-offs, and keeps a live DAG artifact synced.
 ---
 
-# Podo Swarm — `pstack` + OmO DAG Orchestrator
+# Podo Swarm — Phased DAG Orchestrator
 
 Orchestrate multi-agent work on top of native Antigravity `swarm` tools (`swarm`, `post_message`, `read_board`, `swarm_wait`) while optimizing **both engineering rigor and token/time efficiency**.
 
@@ -37,7 +37,7 @@ Expected defaults (unless changed via `/podo-setup`):
 ## Step 1: Auto-DAG Decomposition into Maximum-Parallel Phases
 
 1. **Scout First Only If Context Is Missing**:
-   - If the codebase/call-chain (`/how`, `/why`) is unfamiliar, spawn 1–2 `scout` workers (`model: <roles.scout>`, `workspace: "inherit"`) in `phase-0` to map relevant files, existing test/CI/lint commands, and ownership boundaries.
+   - If the codebase/call-chain (architecture, call graph, and constraints) is unfamiliar, spawn 1–2 `scout` workers (`model: <roles.scout>`, `workspace: "inherit"`) in `phase-0` to map relevant files, existing test/CI/lint commands, and ownership boundaries.
 2. **Partition Into Disjoint DAG Phases (`phase-1`, `phase-2`, ...)**:
    - Maximize parallelism within every Phase by splitting independent work along **strictly disjoint file ownership**. Two builders in the same Phase must **never** touch the same file.
    - Dependent follow-up work goes into the next Phase (`depends_on`).
@@ -81,7 +81,7 @@ Add **one** `interrogator` (`model: <roles.interrogator>`, `workspace: "inherit"
   2. Run `podo-guard.py check --run-verify` and integration checks across the combined Phase `N` surface.
   3. If a defect or recurring mistake is found:
      - Do **not** edit builder files yourself.
-     - Apply `pstack`'s **`encode-lessons-in-structure`**: specify the structural fix required — Type/API boundary tightening, a `.podo/checks.json` rule via `podo-guard.py codify --id ... --fix ...`, CI/linter rule, or a `specs/*.tla` TLA+ specification + TLC model check (or property test) for concurrency/state machines.
+     - Require a permanent structural fix — Type/API boundary tightening, a `.podo/checks.json` rule via `podo-guard.py codify --id ... --fix ...`, CI/linter rule, or a `specs/*.tla` TLA+ specification + TLC model check (or property test) for concurrency/state machines.
      - Post `@<builder> [reject] <defect, reproduction, and required structural guardrail>` so only the responsible builder fixes and re-submits.
   4. When Phase `N` passes completely:
      - Post `@coordinator [phase-N-verified] <summary of checks & structural guardrails>` (and if Phase `N+1` builders already exist and are parked waiting, Coordinator or Phase handoff wakes them; otherwise `@coordinator` merges Phase `N` into the working copy and launches Phase `N+1`).
@@ -98,7 +98,7 @@ Trigger **Arena mode** when the user writes `arena:` / asks to compare approache
 2. Require **both** contenders to pass Tier 1 (`podo-guard.py check --run-verify` + tests) before posting `@interrogator [arena-ready] <test proof & diff summary>`.
 3. `interrogator` (`<roles.interrogator>`) stays silent until **both** `[arena-ready]` posts arrive, then runs **one** batch evaluation comparing:
    - Real execution & edge-case resilience (including TLA+ / property tests if stateful)
-   - Minimal, cleanest diff with zero narration-comment slop
+   - Minimal, cleanest diff with zero inline narration comments
    - Structural safety (types/linters/checks)
 4. `interrogator` posts `@coordinator [arena-winner] <winner or graft plan>`, and Coordinator merges the winning workspace (or grafts the best parts).
 

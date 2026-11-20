@@ -15,7 +15,7 @@ Manage `podo-config.json` role-to-model routing based on real-time Antigravity q
 
 | Role | Default Model ID | Display Name | Purpose |
 | :--- | :--- | :--- | :--- |
-| `scout` | `gemini-4-hydrogen-medium` | Gemini 4 Hydrogen (Medium) | Fast `/how` & `/why` codebase investigation |
+| `scout` | `gemini-4-hydrogen-medium` | Gemini 4 Hydrogen (Medium) | Fast codebase exploration and dependency mapping |
 | `builder` | `gemini-pro-orchestrator-neon` | Orchestrator (Neon) | Main parallel dev workers (`workspace: "share"`) |
 | `arena_a` | `gemini-pro-orchestrator-neon` | Orchestrator (Neon) | Arena Contender A |
 | `arena_b` | `claude-opus-5-5-medium` | Claude Opus 5.5 (Medium) | Arena Contender B (cross-pool) |

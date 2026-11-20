@@ -1,7 +1,7 @@
 {
   "name": "podo-stuff",
-  "displayName": "Podo Stuff (pstack + OmO DAG)",
-  "description": "Deterministic pstack structural guardrails, AST narration-comment gate, per-phase DAG swarm orchestration, and Arena bake-offs on top of native Antigravity Swarm.",
+  "displayName": "Podo Stuff",
+  "description": "Deterministic structural guardrails, comment gates, and phased parallel DAG swarm orchestration for Antigravity.",
   "version": "1.0.0",
   "author": "popododo",
   "homepage": "https://github.com/popododo0720/podo-stuff",

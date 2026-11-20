@@ -1,4 +1,4 @@
-# Podo Stuff Structural Rules (`pstack` + OmO DAG)
+# Podo Stuff Structural Rules
 
 1. **Deterministic Comment Rule (`no-comments`)**:
    - Do **not** write inline narration comments inside function or method bodies explaining what the code is doing step-by-step.
@@ -6,7 +6,7 @@
    - Allowed only: module/file headers, API/function docstrings (`"""..."""`, `/** ... */`, `///`), linter/type directives (`# type:`, `// @ts-`, `# noqa`), and explicit rationale tags (`WHY:`, `INVARIANT:`, `SAFETY:`, `NOTE(popododo):`) for non-obvious constraints.
    - `scripts/podo-guard.py` enforces this deterministically at `Stop` and before every task handoff.
 
-2. **Encode Lessons in Structure (No Soft Prose Rules for Bugs)**:
+2. **Structural Enforcement (No Soft Prose Rules for Bugs)**:
    - When a defect or review rejection occurs, never rely on markdown memory notes to prevent recurrence.
    - Encode the fix permanently into the codebase structure:
      1. **Types & API Boundaries** (make invalid states unrepresentable).
