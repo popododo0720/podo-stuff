@@ -538,9 +538,20 @@ class StopHookTests(unittest.TestCase):
                     },
                 ]
             }
-            (repo / ".podo" / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
-            violations = GUARD.run_codified_checks(repo, cmd_timeout=5, deadline=time.monotonic() + 0.05)
-            self.assertTrue(any("deadline budget" in v for v in violations), violations)
+            checks_path = repo / ".podo" / "checks.json"
+            checks_path.write_text(json.dumps(checks), encoding="utf-8")
+            plugin_data = repo / "plugin-data"
+            with mock.patch.dict(os.environ, {"PLUGIN_DATA": str(plugin_data), "PODO_TRUST_CHECKS": ""}, clear=False):
+                untrusted_err = io.StringIO()
+                with redirect_stderr(untrusted_err):
+                    untrusted_violations = GUARD.run_codified_checks(repo, cmd_timeout=5)
+                self.assertEqual(untrusted_violations, [])
+                self.assertIn("Skipping untrusted required_command", untrusted_err.getvalue())
+
+                digest = GUARD.trust_checks_file(checks_path)
+                self.assertTrue(bool(digest))
+                violations = GUARD.run_codified_checks(repo, cmd_timeout=5, deadline=time.monotonic() + 0.05)
+                self.assertTrue(any("deadline budget" in v for v in violations), violations)
 
 
 class ConfigAndDagTests(unittest.TestCase):
@@ -1859,6 +1870,152 @@ class AutopilotRouterTests(unittest.TestCase):
             self.assertNotIn("metadata", out_sp["injectSteps"][0]["systemMessage"])
             self.assertNotIn("egm-design", out_sp["injectSteps"][0]["systemMessage"]["systemMessage"])
             self.assertNotIn("Goldfish", out_sp["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+    def test_research_mode_health_guard_unconfirmed_swarm_error_telemetry_trust_and_evolve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            artifact_dir = root / "artifacts"
+            artifact_dir.mkdir()
+            plugin_data = root / "plugin-data"
+            env = {
+                "GEMINI_API_KEY": "test-key",
+                "PODO_ROLE": "",
+                "PODO_AUTOPILOT": "",
+                "PLUGIN_DATA": str(plugin_data),
+                "PODO_TRUST_CHECKS": "",
+            }
+
+            research_resp = {
+                "answers": {
+                    "mode": {"winning_option": "research", "confidence": 0.91},
+                    "needs_arena": {"noul": 0.1},
+                    "complexity": {"score": 0.4},
+                    "needs_clarification": {"noul": 0.1},
+                }
+            }
+            rc_r, out_r, _ = self._run_pre_invocation(
+                {"invocationNum": 1, "lastUserInput": "2026년 최신 코딩 에이전트 논문 리서치해줘"},
+                cfg_path,
+                env_overrides=env,
+                mock_response=research_resp,
+            )
+            self.assertEqual(rc_r, 0)
+            self.assertNotIn("metadata", out_r["injectSteps"][0]["systemMessage"])
+            self.assertIn("Podo Autopilot · Research", out_r["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            unconfirmed_swarm = {
+                "answers": {
+                    "mode": {
+                        "winning_option": "swarm",
+                        "confidence": 0.74,
+                        "probabilities": {"swarm": 0.74, "plan": 0.18, "direct": 0.06, "grill": 0.02},
+                    },
+                    "needs_arena": {"noul": 0.2},
+                    "complexity": {"score": 2.5},
+                    "needs_clarification": {"noul": 0.15},
+                    "continues_previous_task": {"noul": 0.12},
+                }
+            }
+            rc_u, out_u, _ = self._run_pre_invocation(
+                {
+                    "invocationNum": 1,
+                    "lastUserInput": "새로운 결제 모듈 만들어줘",
+                    "artifactDirectoryPath": str(artifact_dir),
+                    "conversationId": "conv-unconfirmed-1",
+                },
+                cfg_path,
+                env_overrides=env,
+                mock_response=unconfirmed_swarm,
+            )
+            self.assertEqual(rc_u, 0)
+            self.assertIn("Podo Autopilot · Plan", out_u["injectSteps"][0]["systemMessage"]["systemMessage"])
+
+            transcript = root / "heavy-transcript.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "계속 진행해"}),
+                        json.dumps(
+                            {
+                                "step_index": 1,
+                                "type": "PLANNER_RESPONSE",
+                                "input_tokens": 250000,
+                                "cache_read_tokens": 165000,
+                                "content": "working",
+                            }
+                        ),
+                        json.dumps({"step_index": 2, "type": "GENERIC", "status": "ERROR", "error": "fail 1"}),
+                        json.dumps({"step_index": 3, "type": "GENERIC", "status": "ERROR", "error": "fail 2"}),
+                        json.dumps({"step_index": 4, "type": "GENERIC", "status": "ERROR", "error": "fail 3"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rc_err, out_err, _ = self._run_pre_invocation(
+                {
+                    "invocationNum": 1,
+                    "lastUserInput": "계속 진행해",
+                    "transcriptPath": str(transcript),
+                    "artifactDirectoryPath": str(artifact_dir),
+                    "conversationId": "conv-health-1",
+                },
+                cfg_path,
+                env_overrides=env,
+                mock_response=urllib.error.URLError("timeout"),
+            )
+            self.assertEqual(rc_err, 0)
+            health_msg = out_err["injectSteps"][0]["systemMessage"]["systemMessage"]
+            self.assertIn("/compact", health_msg)
+            self.assertIn("3", health_msg)
+
+            tel_events = [
+                json.loads(line)
+                for line in (artifact_dir / "podo-telemetry.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertTrue(any(ev.get("event") == "autopilot_error" and ev.get("result") == "api_error" for ev in tel_events))
+
+            repo = root / "sample-repo"
+            repo.mkdir()
+            (repo / ".podo").mkdir()
+            checks_file = repo / ".podo" / "checks.json"
+            checks_file.write_text(
+                json.dumps(
+                    {
+                        "checks": [
+                            {"id": "stale-rule", "type": "forbidden_regex", "glob": "*.py", "pattern": "never_hits", "fix": "none"}
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tel_repo = repo / ".podo" / "telemetry.jsonl"
+            tel_repo.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "ts": time.time(),
+                            "event": "hook_stop",
+                            "gate": "no-comments",
+                            "result": "fail",
+                            "files": ["src/app.py"],
+                        }
+                    )
+                    for _ in range(4)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            trust_proc = run_cli(["trust", "--repo", str(repo)], env_overrides=env)
+            self.assertEqual(trust_proc.returncode, 0, trust_proc.stderr)
+            evolve_proc = run_cli(["evolve", "--repo", str(repo), "--min-count", "3", "--json"], env_overrides=env)
+            self.assertEqual(evolve_proc.returncode, 0, evolve_proc.stderr)
+            ev_report = json.loads(evolve_proc.stdout)
+            self.assertTrue(ev_report["suggestions"])
+            self.assertTrue(any(r.get("id") == "stale-rule" for r in ev_report["stale_rules"]))
 
 
 if __name__ == "__main__":

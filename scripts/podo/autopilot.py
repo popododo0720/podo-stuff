@@ -11,12 +11,19 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_CONFIG_PATH = PLUGIN_ROOT / "podo-config.json"
+from podo.common import (
+    DEFAULT_CONFIG_PATH,
+    PLUGIN_ROOT,
+    is_telemetry_enabled,
+    load_effective_config,
+    load_json_dict,
+    resolve_user_data_dir,
+    sanitize_identifier,
+    utc_now_iso,
+)
 
 DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "enabled": True,
@@ -30,9 +37,19 @@ DEFAULT_AUTOPILOT_CONFIG: dict[str, Any] = {
     "egm_plan_review": True,
     "show_banner": True,
     "timeout_s": 5,
+    "context_warn_tokens": 400000,
+    "error_loop_threshold": 3,
 }
 
 AUTOPILOT_SKIP_ROLES = {"builder", "scout", "interrogator", "monitor", "arena_a", "arena_b"}
+NON_TOOL_STEP_TYPES = {
+    "USER_INPUT",
+    "PLANNER_RESPONSE",
+    "SYSTEM_MESSAGE",
+    "EPHEMERAL_MESSAGE",
+    "CHECKPOINT",
+    "CONVERSATION_HISTORY",
+}
 
 AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
     "continues_previous_task": {
@@ -47,6 +64,7 @@ AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
             "swarm": "Multi-file implementation, new feature build, broad refactoring, or autonomous end-to-end coding task (including approving a previously discussed multi-item plan to start building) that benefits from parallel podo-swarm execution.",
             "plan": "Architecture design, system trade-off analysis, or step-by-step planning requested before writing code.",
             "grill": "Adversarial code review, security or bug audit, or critical evaluation challenging flaws in code or design.",
+            "research": "Deep technical research, literature/paper survey, broad multi-source web or codebase investigation, or competitive/benchmark comparison requiring thorough parallel research rather than a quick lookup.",
         },
     },
     "needs_arena": {
@@ -71,38 +89,7 @@ AUTOPILOT_DECISION_QUESTIONS: dict[str, Any] = {
 }
 
 API_KEY_YAML_RE = re.compile(r"^\s*api_key\s*:\s*['\"]?([^'\"#\s]+)['\"]?\s*$")
-SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 USER_REQUEST_TAG_RE = re.compile(r"<USER_REQUEST>\s*(.*?)\s*</USER_REQUEST>", re.DOTALL)
-
-
-def utc_now_iso() -> str:
-    """Return the current UTC timestamp in ISO-8601 format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def sanitize_identifier(raw: str) -> str:
-    """Sanitize a conversation or session identifier for safe filename usage."""
-    cleaned = SAFE_ID_RE.sub("_", raw.strip()).strip("._")
-    return cleaned[:96] or "session"
-
-
-def load_json_dict(path: Path | None) -> dict[str, Any]:
-    """Load a JSON object from disk, returning an empty dict on failure."""
-    if path is None or not path.is_file():
-        return {}
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        return parsed if isinstance(parsed, dict) else {}
-    except (json.JSONDecodeError, OSError):
-        return {}
-
-
-def is_telemetry_enabled(cfg: dict[str, Any]) -> bool:
-    """Return whether JSONL telemetry emission is enabled in configuration."""
-    telemetry = cfg.get("telemetry", {})
-    if isinstance(telemetry, dict) and "enabled" in telemetry:
-        return bool(telemetry["enabled"])
-    return True
 
 
 def get_autopilot_config(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -132,6 +119,12 @@ def get_autopilot_config(cfg: dict[str, Any]) -> dict[str, Any]:
             merged["show_banner"] = bool(raw["show_banner"])
         if isinstance(raw.get("timeout_s"), (int, float)) and raw["timeout_s"] > 0:
             merged["timeout_s"] = float(raw["timeout_s"])
+        context_warn = raw.get("context_warn_tokens")
+        if isinstance(context_warn, (int, float)) and not isinstance(context_warn, bool) and context_warn > 0:
+            merged["context_warn_tokens"] = int(context_warn)
+        error_loop = raw.get("error_loop_threshold")
+        if isinstance(error_loop, (int, float)) and not isinstance(error_loop, bool) and error_loop > 0:
+            merged["error_loop_threshold"] = int(error_loop)
     return merged
 
 
@@ -226,19 +219,136 @@ def inspect_transcript_for_autopilot(
     return joined[-max_chars:], latest_user_step
 
 
+def inspect_session_health(
+    transcript_path: Path | None,
+    context_warn_tokens: int = 400000,
+    error_loop_threshold: int = 3,
+) -> dict[str, Any]:
+    """Scan transcript.jsonl for latest context token usage and trailing consecutive tool errors."""
+    if transcript_path is None or not transcript_path.is_file():
+        return {
+            "context_tokens": 0,
+            "context_warning": False,
+            "consecutive_errors": 0,
+            "error_loop_warning": False,
+        }
+    try:
+        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {
+            "context_tokens": 0,
+            "context_warning": False,
+            "consecutive_errors": 0,
+            "error_loop_warning": False,
+        }
+
+    latest_tokens = 0
+    trailing_errors = 0
+    for line in lines[-200:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        step_type = str(entry.get("type") or "").strip().upper()
+        status = str(entry.get("status") or "").strip().upper()
+
+        if step_type == "PLANNER_RESPONSE":
+            usage = entry.get("usage") if isinstance(entry.get("usage"), dict) else {}
+            has_tokens = (
+                "input_tokens" in entry
+                or "cache_read_tokens" in entry
+                or "input_tokens" in usage
+                or "cache_read_tokens" in usage
+            )
+            if has_tokens:
+                in_tok = entry.get("input_tokens") if "input_tokens" in entry else usage.get("input_tokens")
+                cache_tok = (
+                    entry.get("cache_read_tokens")
+                    if "cache_read_tokens" in entry
+                    else usage.get("cache_read_tokens")
+                )
+                try:
+                    latest_tokens = max(0, int(in_tok or 0) + int(cache_tok or 0))
+                except (TypeError, ValueError):
+                    pass
+            continue
+
+        if step_type == "USER_INPUT":
+            trailing_errors = 0
+            continue
+
+        if step_type in NON_TOOL_STEP_TYPES:
+            continue
+
+        if status == "ERROR":
+            trailing_errors += 1
+        elif status == "DONE":
+            trailing_errors = 0
+
+    return {
+        "context_tokens": latest_tokens,
+        "context_warning": context_warn_tokens > 0 and latest_tokens >= context_warn_tokens,
+        "consecutive_errors": trailing_errors,
+        "error_loop_warning": error_loop_threshold > 0 and trailing_errors >= error_loop_threshold,
+    }
+
+
+def build_session_health_directive(
+    health: dict[str, Any],
+    context_warn_tokens: int = 400000,
+    error_loop_threshold: int = 3,
+) -> str:
+    """Build concise Context Rot and Error Loop guard directives when health thresholds are exceeded."""
+    parts: list[str] = []
+    if health.get("context_warning"):
+        tokens = int(health.get("context_tokens") or 0)
+        parts.append(
+            f"[Podo Health Guard · Context Rot] Session context reached {tokens:,} tokens "
+            f"(threshold={context_warn_tokens:,}, Context Rot risk). Keep responses concise and recommend `/compact` to the user."
+        )
+    if health.get("error_loop_warning"):
+        errors = int(health.get("consecutive_errors") or 0)
+        parts.append(
+            f"[Podo Health Guard · Error Loop] Detected {errors} consecutive tool errors "
+            f"(threshold={error_loop_threshold}, thrashing). Stop repeating the same failing approach; diagnose the root cause and switch strategy before retrying."
+        )
+    return "\n\n".join(parts)
+
+
+def attach_health_guard_to_payload(
+    response_obj: dict[str, Any],
+    health_directive: str,
+) -> dict[str, Any]:
+    """Attach health guard text to an existing injectSteps systemMessage or create one without metadata."""
+    if not health_directive:
+        return response_obj
+    steps = response_obj.get("injectSteps") if isinstance(response_obj, dict) else None
+    if isinstance(steps, list) and steps:
+        first = steps[0]
+        if isinstance(first, dict) and isinstance(first.get("systemMessage"), dict):
+            existing = first["systemMessage"].get("systemMessage")
+            if isinstance(existing, str) and existing.strip():
+                return {"injectSteps": [{"systemMessage": {"systemMessage": f"{existing}\n\n{health_directive}"}}]}
+    return wrap_autopilot_system_message(health_directive, "", False)
+
+
 def resolve_autopilot_state_path(
     conversation_id: str,
     artifact_dir: Path | None = None,
 ) -> Path | None:
-    """Resolve persistent per-conversation state file path using PLUGIN_DATA or artifact_dir."""
+    """Resolve persistent per-conversation state file path using PLUGIN_DATA, artifact_dir, or user data dir."""
     if not conversation_id:
         return None
-    plugin_data = os.environ.get("PLUGIN_DATA", "").strip()
-    if plugin_data:
-        return Path(plugin_data).resolve() / "autopilot-state" / f"{sanitize_identifier(conversation_id)}.json"
+    if os.environ.get("PLUGIN_DATA", "").strip():
+        return resolve_user_data_dir() / "autopilot-state" / f"{sanitize_identifier(conversation_id)}.json"
     if artifact_dir is not None:
         return artifact_dir / "podo-autopilot-state.json"
-    return None
+    return resolve_user_data_dir() / "autopilot-state" / f"{sanitize_identifier(conversation_id)}.json"
 
 
 def compute_turn_key(conversation_id: str, user_input: str, latest_user_step: int = -1) -> str:
@@ -272,7 +382,7 @@ def parse_decisions_response(data: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(probs_raw, dict) and probs_raw:
             winning = str(max(probs_raw.items(), key=lambda kv: float(kv[1] or 0.0))[0])
     mode = str(winning).strip().lower()
-    if mode not in {"direct", "swarm", "plan", "grill"}:
+    if mode not in {"direct", "swarm", "plan", "grill", "research"}:
         return None
     confidence_raw = mode_ans.get("confidence")
     confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.0
@@ -324,12 +434,12 @@ def parse_decisions_response(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def call_decisions_api(
+def call_decisions_api_with_status(
     prompt_text: str,
     api_key: str,
     autopilot_cfg: dict[str, Any],
-) -> dict[str, Any] | None:
-    """Call Gemini Decisions API (gemini-decision-1) with 0 output tokens and fail-open error handling."""
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Call Gemini Decisions API and return (decision, error_kind) distinguishing api_error vs parse_error."""
     url = str(autopilot_cfg.get("api_base_url") or DEFAULT_AUTOPILOT_CONFIG["api_base_url"])
     model = str(autopilot_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"])
     timeout_s = float(autopilot_cfg.get("timeout_s") or DEFAULT_AUTOPILOT_CONFIG["timeout_s"])
@@ -353,12 +463,28 @@ def call_decisions_api(
     try:
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
+        return None, "api_error"
+    try:
         parsed = json.loads(raw)
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError, ValueError):
-        return None
+    except (json.JSONDecodeError, ValueError):
+        return None, "parse_error"
     if not isinstance(parsed, dict):
-        return None
-    return parse_decisions_response(parsed)
+        return None, "parse_error"
+    decision = parse_decisions_response(parsed)
+    if decision is None:
+        return None, "parse_error"
+    return decision, None
+
+
+def call_decisions_api(
+    prompt_text: str,
+    api_key: str,
+    autopilot_cfg: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Call Gemini Decisions API (gemini-decision-1) with fail-open error handling."""
+    decision, _ = call_decisions_api_with_status(prompt_text, api_key, autopilot_cfg)
+    return decision
 
 
 def wrap_autopilot_system_message(directive: str, banner: str, show_banner: bool) -> dict[str, Any]:
@@ -376,7 +502,7 @@ def evaluate_autopilot_decision_detailed(
     autopilot_cfg: dict[str, Any],
     plugin_root: Path = PLUGIN_ROOT,
 ) -> tuple[str, str, dict[str, Any]]:
-    """Resolve (effective_mode, route_reason, injectSteps_payload) via the 5-state decision matrix."""
+    """Resolve (effective_mode, route_reason, injectSteps_payload) via the 6-state decision matrix."""
     mode = str(decision.get("mode") or "direct")
     confidence = float(decision.get("confidence") or 0.0)
     probs = decision.get("probabilities") if isinstance(decision.get("probabilities"), dict) else {}
@@ -388,6 +514,7 @@ def evaluate_autopilot_decision_detailed(
     needs_arena = float(decision.get("needs_arena_prob") or 0.0) >= arena_threshold
     complexity_score = decision.get("complexity_score")
     clarification_prob = decision.get("needs_clarification_prob")
+    continues_prob = decision.get("continues_previous_task_prob")
     egm_plan_review = bool(autopilot_cfg.get("egm_plan_review", True))
     show_banner = bool(autopilot_cfg.get("show_banner", True))
 
@@ -423,6 +550,24 @@ def evaluate_autopilot_decision_detailed(
         if mode == "swarm":
             if is_low_complexity:
                 return "direct", "low_complexity_downgrade", {}
+            unconfirmed_swarm = (
+                is_complex
+                and isinstance(continues_prob, (int, float))
+                and float(continues_prob) < 0.5
+                and (confidence < 0.85 or float(complexity_score) < 3.0)
+            )
+            if unconfirmed_swarm:
+                banner = (
+                    f"🏗️ **[Podo Autopilot · Plan]** 새 구현 요청으로 판단되어 병렬 스웜 실행 전 계획을 먼저 제안합니다. "
+                    f"*(신뢰도 {conf_pct} · 복잡도 {float(complexity_score):.1f}/4{egm_note})*"
+                )
+                directive = (
+                    f"[Podo Autopilot Router] gemini-decision-1 classified a new unconfirmed request as SWARM "
+                    f"(confidence={conf_pct}, complexity={float(complexity_score):.2f}, continues_previous_task={float(continues_prob):.2f}). "
+                    "Present a concise architecture and step-by-step execution plan first so the user can approve before spawning parallel swarm workers."
+                    + egm_directive
+                )
+                return "plan", "unconfirmed_swarm_to_plan", wrap_autopilot_system_message(directive, banner, show_banner)
             arena_note = " · Arena 권장" if needs_arena else ""
             arena_directive = (
                 " The decision model also flagged high architectural risk (`needs_arena=true`), so consider dual-model Arena competition for the core module."
@@ -444,6 +589,14 @@ def evaluate_autopilot_decision_detailed(
                 "Act as an adversarial senior reviewer: scrutinize security holes, race conditions, hidden assumptions, edge cases, and architectural flaws before proposing fixes."
             )
             effective_mode = "grill"
+        elif mode == "research":
+            banner = f"🔎 **[Podo Autopilot · Research]** 심층 리서치 모드로 자동 전환합니다. *(신뢰도 {conf_pct})*"
+            directive = (
+                f"[Podo Autopilot Router] gemini-decision-1 classified this request as RESEARCH (confidence={conf_pct}). "
+                "Run thorough parallel web and/or codebase research (using `search_web`, a `research` subagent, or `gemini-api` Deep Research when appropriate), "
+                "cross-check primary sources, papers, and benchmarks, and deliver a structured, citation-backed synthesis."
+            )
+            effective_mode = "research"
         else:
             banner = f"🏗️ **[Podo Autopilot · Plan]** 구현 전 아키텍처·단계별 설계 모드로 자동 전환합니다. *(신뢰도 {conf_pct}{egm_note})*"
             directive = (
@@ -524,8 +677,10 @@ def emit_autopilot_telemetry(
     previous_mode: str,
     injected: bool,
     duration_ms: float,
+    context_tokens: int = 0,
+    consecutive_errors: int = 0,
 ) -> bool:
-    """Append an autopilot_route JSONL telemetry event with calibrated probability diagnostics."""
+    """Append an autopilot_route JSONL telemetry event with calibrated probability and health diagnostics."""
     if not is_telemetry_enabled(cfg) or target_path is None:
         return False
     record: dict[str, Any] = {
@@ -548,6 +703,53 @@ def emit_autopilot_telemetry(
         "needs_clarification_prob": decision.get("needs_clarification_prob"),
         "continues_previous_task_prob": decision.get("continues_previous_task_prob"),
         "previous_mode": previous_mode,
+        "context_tokens": int(context_tokens),
+        "consecutive_errors": int(consecutive_errors),
+        "injected": bool(injected),
+        "violation_count": 0,
+        "files": [],
+        "duration_ms": round(max(0.0, float(duration_ms)), 2),
+    }
+    try:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with target_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def emit_autopilot_error_telemetry(
+    cfg: dict[str, Any],
+    target_path: Path | None,
+    *,
+    conversation_id: str,
+    model: str,
+    error_kind: str,
+    previous_mode: str,
+    duration_ms: float,
+    context_tokens: int = 0,
+    consecutive_errors: int = 0,
+    injected: bool = False,
+) -> bool:
+    """Append an autopilot_error JSONL telemetry event for observable API or schema drift failures."""
+    if not is_telemetry_enabled(cfg) or target_path is None:
+        return False
+    record: dict[str, Any] = {
+        "ts": round(time.time(), 3),
+        "iso_ts": utc_now_iso(),
+        "event": "autopilot_error",
+        "conversation_id": conversation_id,
+        "phase": "",
+        "worker": "",
+        "role": "autopilot",
+        "model": model,
+        "gate": "autopilot-router",
+        "result": error_kind,
+        "error_kind": error_kind,
+        "previous_mode": previous_mode,
+        "context_tokens": int(context_tokens),
+        "consecutive_errors": int(consecutive_errors),
         "injected": bool(injected),
         "violation_count": 0,
         "files": [],
@@ -578,7 +780,7 @@ def build_router_prompt(
 
 
 def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
-    """Route user requests automatically via Gemini Decisions API before the main model runs."""
+    """Route user requests automatically via Gemini Decisions API and enforce session health guards."""
     t0 = time.monotonic()
     env_toggle = os.environ.get("PODO_AUTOPILOT", "").strip().lower()
     if env_toggle in {"off", "false", "0"}:
@@ -600,8 +802,46 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         print("{}")
         return 0
 
+    cfg = load_effective_config(config_path)
+    ap_cfg = get_autopilot_config(cfg)
+    if not ap_cfg.get("enabled", True):
+        print("{}")
+        return 0
+
+    transcript_raw = payload.get("transcriptPath") or payload.get("transcript_path")
+    transcript_path = (
+        Path(transcript_raw.strip()).resolve()
+        if isinstance(transcript_raw, str) and transcript_raw.strip()
+        else None
+    )
+    context_warn_tokens = int(ap_cfg.get("context_warn_tokens", DEFAULT_AUTOPILOT_CONFIG["context_warn_tokens"]))
+    error_loop_threshold = int(ap_cfg.get("error_loop_threshold", DEFAULT_AUTOPILOT_CONFIG["error_loop_threshold"]))
+    health = inspect_session_health(
+        transcript_path,
+        context_warn_tokens=context_warn_tokens,
+        error_loop_threshold=error_loop_threshold,
+    )
+    health_directive = build_session_health_directive(
+        health,
+        context_warn_tokens=context_warn_tokens,
+        error_loop_threshold=error_loop_threshold,
+    )
+
     inv_num = payload.get("invocationNum")
     if isinstance(inv_num, int) and inv_num > 1:
+        if health.get("error_loop_warning"):
+            loop_directive = build_session_health_directive(
+                {
+                    "context_tokens": health["context_tokens"],
+                    "context_warning": False,
+                    "consecutive_errors": health["consecutive_errors"],
+                    "error_loop_warning": True,
+                },
+                context_warn_tokens=context_warn_tokens,
+                error_loop_threshold=error_loop_threshold,
+            )
+            print(json.dumps(attach_health_guard_to_payload({}, loop_directive), ensure_ascii=False))
+            return 0
         print("{}")
         return 0
 
@@ -614,28 +854,11 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         print("{}")
         return 0
 
-    cfg = load_json_dict(config_path)
-    ap_cfg = get_autopilot_config(cfg)
-    if not ap_cfg.get("enabled", True):
-        print("{}")
-        return 0
-
-    api_key = resolve_gemini_api_key()
-    if not api_key:
-        print("{}")
-        return 0
-
     conv_id = str(payload.get("conversationId") or payload.get("conversation_id") or "").strip()
     artifact_raw = payload.get("artifactDirectoryPath") or payload.get("artifact_directory_path") or ""
     artifact_dir = (
         Path(artifact_raw.strip()).resolve()
         if isinstance(artifact_raw, str) and artifact_raw.strip()
-        else None
-    )
-    transcript_raw = payload.get("transcriptPath") or payload.get("transcript_path")
-    transcript_path = (
-        Path(transcript_raw.strip()).resolve()
-        if isinstance(transcript_raw, str) and transcript_raw.strip()
         else None
     )
     recent_ctx, latest_user_step = inspect_transcript_for_autopilot(transcript_path)
@@ -644,6 +867,27 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     prev_state = load_json_dict(state_path)
     turn_key = compute_turn_key(conv_id, cleaned_input, latest_user_step) if conv_id else ""
     if turn_key and prev_state.get("last_turn_key") == turn_key:
+        if health.get("error_loop_warning"):
+            loop_directive = build_session_health_directive(
+                {
+                    "context_tokens": health["context_tokens"],
+                    "context_warning": False,
+                    "consecutive_errors": health["consecutive_errors"],
+                    "error_loop_warning": True,
+                },
+                context_warn_tokens=context_warn_tokens,
+                error_loop_threshold=error_loop_threshold,
+            )
+            print(json.dumps(attach_health_guard_to_payload({}, loop_directive), ensure_ascii=False))
+            return 0
+        print("{}")
+        return 0
+
+    api_key = resolve_gemini_api_key()
+    if not api_key:
+        if health_directive:
+            print(json.dumps(attach_health_guard_to_payload({}, health_directive), ensure_ascii=False))
+            return 0
         print("{}")
         return 0
 
@@ -654,8 +898,28 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         previous_mode=previous_mode,
     )
 
-    decision = call_decisions_api(prompt_text, api_key, ap_cfg)
+    cwd = payload.get("cwd") or (payload.get("workspacePaths") or [None])[0]
+    repo = Path(cwd).resolve() if isinstance(cwd, str) and cwd and Path(cwd).is_dir() else None
+    telemetry_target = resolve_autopilot_telemetry_target(repo=repo, artifact_dir=artifact_dir)
+    model_name = str(ap_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"])
+
+    decision, error_kind = call_decisions_api_with_status(prompt_text, api_key, ap_cfg)
     if decision is None:
+        emit_autopilot_error_telemetry(
+            cfg,
+            telemetry_target,
+            conversation_id=conv_id,
+            model=model_name,
+            error_kind=error_kind or "api_error",
+            previous_mode=previous_mode,
+            duration_ms=(time.monotonic() - t0) * 1000.0,
+            context_tokens=int(health.get("context_tokens") or 0),
+            consecutive_errors=int(health.get("consecutive_errors") or 0),
+            injected=bool(health_directive),
+        )
+        if health_directive:
+            print(json.dumps(attach_health_guard_to_payload({}, health_directive), ensure_ascii=False))
+            return 0
         print("{}")
         return 0
 
@@ -664,6 +928,8 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
         ap_cfg,
         plugin_root=config_path.parent,
     )
+    response_obj = attach_health_guard_to_payload(response_obj, health_directive)
+
     if state_path is not None and turn_key:
         save_autopilot_state(
             state_path,
@@ -677,20 +943,19 @@ def handle_hook_pre_invocation(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
             },
         )
 
-    cwd = payload.get("cwd") or (payload.get("workspacePaths") or [None])[0]
-    repo = Path(cwd).resolve() if isinstance(cwd, str) and cwd and Path(cwd).is_dir() else None
-    telemetry_target = resolve_autopilot_telemetry_target(repo=repo, artifact_dir=artifact_dir)
     emit_autopilot_telemetry(
         cfg,
         telemetry_target,
         conversation_id=conv_id,
-        model=str(ap_cfg.get("model") or DEFAULT_AUTOPILOT_CONFIG["model"]),
+        model=model_name,
         decision=decision,
         effective_mode=effective_mode,
         route_reason=route_reason,
         previous_mode=previous_mode,
         injected=bool(response_obj),
         duration_ms=(time.monotonic() - t0) * 1000.0,
+        context_tokens=int(health.get("context_tokens") or 0),
+        consecutive_errors=int(health.get("consecutive_errors") or 0),
     )
 
     print(json.dumps(response_obj, ensure_ascii=False))

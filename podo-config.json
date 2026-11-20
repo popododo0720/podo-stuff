@@ -7,19 +7,13 @@
     "interrogator": "claude-opus-5-5-medium",
     "monitor": "gemini-4-hydrogen-low"
   },
-  "roles": {
-    "scout": "gemini-4-hydrogen-medium",
-    "builder": "gemini-pro-orchestrator-neon",
-    "arena_a": "gemini-pro-orchestrator-neon",
-    "arena_b": "claude-opus-5-5-medium",
-    "interrogator": "claude-opus-5-5-medium",
-    "monitor": "gemini-4-hydrogen-low"
-  },
   "gates": {
     "stop_hook_mode": "enforce",
     "per_task_deterministic_script": true,
     "dead_code_check": true,
     "interrogator_cadence": "per_dag_phase",
+    "max_rejects_before_escalation": 2,
+    "escalation_role": "interrogator",
     "allow_comment_tags": [
       "WHY:",
       "INVARIANT:",
@@ -52,6 +46,8 @@
     "complexity_min_for_swarm": 2.2,
     "clarification_threshold": 0.9,
     "boundary_plan_threshold": 0.75,
+    "context_warn_tokens": 400000,
+    "error_loop_threshold": 3,
     "egm_plan_review": true,
     "show_banner": true,
     "timeout_s": 5

@@ -18,12 +18,12 @@ from podo.autopilot import (
     DEFAULT_CONFIG_PATH,
     PLUGIN_ROOT,
     build_router_prompt,
-    call_decisions_api,
+    call_decisions_api_with_status,
     evaluate_autopilot_decision_detailed,
     get_autopilot_config,
-    load_json_dict,
     resolve_gemini_api_key,
 )
+from podo.common import load_effective_config
 
 
 def evaluate_golden_dataset(
@@ -31,7 +31,10 @@ def evaluate_golden_dataset(
     config_path: Path = DEFAULT_CONFIG_PATH,
 ) -> dict[str, Any]:
     """Run all golden test cases against gemini-decision-1 and return accuracy metrics."""
-    cfg = load_json_dict(config_path)
+    cfg = load_effective_config(
+        config_path,
+        explicit_path=(config_path.resolve() != DEFAULT_CONFIG_PATH.resolve()),
+    )
     ap_cfg = get_autopilot_config(cfg)
     api_key = resolve_gemini_api_key()
     if not api_key:
@@ -57,13 +60,13 @@ def evaluate_golden_dataset(
 
         prompt = build_router_prompt(user_input, recent_ctx=recent_ctx, previous_mode=prev_mode)
         t0 = time.monotonic()
-        decision = call_decisions_api(prompt, api_key, ap_cfg)
+        decision, error_kind = call_decisions_api_with_status(prompt, api_key, ap_cfg)
         elapsed_ms = round((time.monotonic() - t0) * 1000.0, 2)
         total_ms += elapsed_ms
 
         if decision is None:
             effective_mode = "error"
-            route_reason = "api_error"
+            route_reason = error_kind or "api_error"
             arena_ok = False
             cont_ok = False
         else:
@@ -147,8 +150,8 @@ def main() -> int:
         mark = "PASS" if row["ok"] else "FAIL"
         print(
             f"[{mark}] {row['id']:30s} expected={','.join(row['expected']):14s} "
-            f"actual={row['actual']:8s} reason={row['route_reason']:24s} "
-            f"raw={str(row['raw_mode']):6s} conf={row['confidence']} comp={row['complexity_score']} "
+            f"actual={row['actual']:8s} reason={row['route_reason']:25s} "
+            f"raw={str(row['raw_mode']):8s} conf={row['confidence']} comp={row['complexity_score']} "
             f"clar={row['needs_clarification_prob']} cont={row['continues_previous_task_prob']} ({row['duration_ms']:.0f}ms)"
         )
     print("Confusion:", json.dumps(report["confusion"], ensure_ascii=False))

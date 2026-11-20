@@ -38,23 +38,42 @@ from podo.autopilot import (
     parse_decisions_response,
     resolve_gemini_api_key,
 )
+from podo.common import (
+    DEFAULT_CONFIG_PATH,
+    PLUGIN_ROOT,
+    is_checks_file_trusted,
+    is_telemetry_enabled,
+    load_effective_config,
+    load_json_dict,
+    resolve_user_config_path,
+    sanitize_identifier,
+    trust_checks_file,
+    utc_now_iso,
+)
 
 __all__ = [
     "AUTOPILOT_DECISION_QUESTIONS",
     "AUTOPILOT_SKIP_ROLES",
     "DEFAULT_AUTOPILOT_CONFIG",
+    "DEFAULT_CONFIG_PATH",
+    "PLUGIN_ROOT",
     "build_autopilot_injection",
     "call_decisions_api",
     "evaluate_autopilot_decision",
     "extract_recent_transcript_context",
     "get_autopilot_config",
     "handle_hook_pre_invocation",
+    "is_checks_file_trusted",
+    "is_telemetry_enabled",
+    "load_effective_config",
+    "load_json_dict",
     "parse_decisions_response",
     "resolve_gemini_api_key",
+    "resolve_user_config_path",
+    "sanitize_identifier",
+    "trust_checks_file",
+    "utc_now_iso",
 ]
-
-PLUGIN_ROOT = SCRIPTS_DIR.parent
-DEFAULT_CONFIG_PATH = PLUGIN_ROOT / "podo-config.json"
 
 DEFAULT_ALLOW_TAGS = ("WHY:", "INVARIANT:", "SAFETY:", "NOTE(popododo):")
 
@@ -227,6 +246,8 @@ def default_config() -> dict[str, Any]:
             "per_task_deterministic_script": True,
             "dead_code_check": True,
             "interrogator_cadence": "per_dag_phase",
+            "max_rejects_before_escalation": 2,
+            "escalation_role": "interrogator",
             "allow_comment_tags": list(DEFAULT_ALLOW_TAGS),
         },
         "telemetry": {
@@ -239,19 +260,19 @@ def default_config() -> dict[str, Any]:
 
 
 def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
-    """Load podo-config.json from the plugin directory or fallback defaults."""
-    if config_path.is_file():
-        try:
-            loaded = json.loads(config_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                return loaded
-        except (json.JSONDecodeError, OSError):
-            return default_config()
+    """Load effective podo-config.json merged with persistent user overrides, or fallback defaults."""
+    loaded = load_effective_config(
+        config_path,
+        explicit_path=(config_path.resolve() != DEFAULT_CONFIG_PATH.resolve()),
+    )
+    if loaded:
+        return loaded
     return default_config()
 
 
 def save_config(cfg: dict[str, Any], config_path: Path = DEFAULT_CONFIG_PATH) -> None:
     """Persist updated configuration to podo-config.json."""
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -268,14 +289,6 @@ def is_dead_code_check_enabled(cfg: dict[str, Any]) -> bool:
     gates = cfg.get("gates", {})
     if isinstance(gates, dict) and "dead_code_check" in gates:
         return bool(gates["dead_code_check"])
-    return True
-
-
-def is_telemetry_enabled(cfg: dict[str, Any]) -> bool:
-    """Return whether JSONL telemetry emission is enabled."""
-    telemetry = cfg.get("telemetry", {})
-    if isinstance(telemetry, dict) and "enabled" in telemetry:
-        return bool(telemetry["enabled"])
     return True
 
 
@@ -1271,6 +1284,8 @@ def run_codified_checks(
 
     violations: list[str] = []
     repo_files: list[Path] | None = None
+    checks_trusted: bool | None = None
+    warned_untrusted = False
 
     for item in checks:
         if not isinstance(item, dict):
@@ -1307,6 +1322,17 @@ def run_codified_checks(
         elif ctype == "required_command":
             command = item.get("command", "")
             if not command:
+                continue
+            if checks_trusted is None:
+                checks_trusted = is_checks_file_trusted(checks_file)
+            if not checks_trusted:
+                if not warned_untrusted:
+                    print(
+                        f"[podo-guard] Skipping untrusted required_command in .podo/checks.json; "
+                        f"run 'podo-guard.py trust --repo {repo}' to approve.",
+                        file=sys.stderr,
+                    )
+                    warned_untrusted = True
                 continue
             effective_timeout = float(cmd_timeout)
             if deadline is not None:
@@ -1384,11 +1410,6 @@ def resolve_diff_text_arg(arg: str | None) -> str | None:
     return arg
 
 
-def utc_now_iso() -> str:
-    """Return current UTC timestamp formatted in ISO-8601 Zulu form."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def parse_iso_timestamp(value: str | None) -> float | None:
     """Parse an ISO-8601 timestamp string into POSIX epoch seconds."""
     if not value or not isinstance(value, str):
@@ -1447,12 +1468,6 @@ def format_compact_time_range(started_at: str | None, finished_at: str | None) -
     if d_start and d_end and d_start != d_end:
         return f"{d_start[5:]} {t_start} → {d_end[5:]} {t_end} UTC"
     return f"{t_start} → {t_end} UTC"
-
-
-def sanitize_identifier(raw: str) -> str:
-    """Convert an identifier into a filesystem-safe filename token."""
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", raw.strip())
-    return cleaned.strip("._") or "session"
 
 
 def classify_violation_gate(violations: list[str]) -> str:
@@ -2047,17 +2062,6 @@ def discover_observability_paths(
     return state_path, telemetry_path, artifact_dir
 
 
-def load_json_dict(path: Path | None) -> dict[str, Any] | None:
-    """Read a JSON object from disk, returning None on absence or parse failure."""
-    if path is None or not path.is_file():
-        return None
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-        return parsed if isinstance(parsed, dict) else None
-    except (json.JSONDecodeError, OSError):
-        return None
-
-
 def cmd_check(args: argparse.Namespace) -> int:
     """Execute deterministic comment, AST dead-code, structural check, and optional verify.sh gates."""
     t0 = time.monotonic()
@@ -2168,6 +2172,7 @@ def cmd_codify(args: argparse.Namespace) -> int:
     checks.append(entry)
     data["checks"] = checks
     checks_file.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    trust_checks_file(checks_file)
 
     telemetry_target = resolve_telemetry_target(explicit_path=getattr(args, "telemetry_file", None), repo=repo)
     emit_telemetry_event(
@@ -2185,6 +2190,21 @@ def cmd_codify(args: argparse.Namespace) -> int:
         duration_ms=(time.monotonic() - t0) * 1000.0,
     )
     print(f"[podo-guard] Codified structural check '{args.id}' into {checks_file}")
+    return 0
+
+
+def cmd_trust(args: argparse.Namespace) -> int:
+    """Approve the current SHA-256 hash of <repo>/.podo/checks.json for required_command execution."""
+    repo = Path(args.repo).resolve()
+    checks_file = repo / ".podo" / "checks.json"
+    if not checks_file.is_file():
+        print(f"Error: checks file not found: {checks_file}", file=sys.stderr)
+        return 2
+    digest = trust_checks_file(checks_file)
+    if not digest:
+        print(f"Error: failed to hash checks file: {checks_file}", file=sys.stderr)
+        return 2
+    print(f"[podo-guard] Trusted {checks_file} (sha256={digest})")
     return 0
 
 
@@ -3409,8 +3429,10 @@ def cmd_dag(args: argparse.Namespace) -> int:
 
 def cmd_config(args: argparse.Namespace) -> int:
     """Display or update podo-config.json role mappings and gate modes."""
-    config_path = Path(args.config).resolve() if args.config else DEFAULT_CONFIG_PATH
-    cfg = load_config(config_path)
+    explicit_config = Path(args.config).resolve() if args.config else None
+    read_path = explicit_config if explicit_config is not None else DEFAULT_CONFIG_PATH
+    write_path = explicit_config if explicit_config is not None else resolve_user_config_path()
+    cfg = load_config(read_path)
     changed = False
 
     do_reset = bool(args.reset)
@@ -3454,7 +3476,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         changed = True
 
     if changed:
-        save_config(cfg, config_path)
+        save_config(cfg, write_path)
 
     if args.show or not changed:
         print(json.dumps(cfg, indent=2, ensure_ascii=False))
@@ -3728,6 +3750,241 @@ def cmd_telemetry(args: argparse.Namespace) -> int:
     return 0
 
 
+def slugify_rule_token(raw: str) -> str:
+    """Normalize a gate or file token into a lowercase hyphenated check id fragment."""
+    token = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return token or "rule"
+
+
+def build_evolution_suggestion(gate: str, file_path: str, count: int) -> dict[str, Any]:
+    """Build an actionable rule-codification suggestion for a recurring failure hotspot."""
+    gate_slug = slugify_rule_token(gate)
+    if file_path:
+        file_slug = slugify_rule_token(Path(file_path).stem or file_path)
+        suggested_id = f"evolve-{gate_slug}-{file_slug}"[:64].rstrip("-")
+    else:
+        suggested_id = f"evolve-{gate_slug}"[:64].rstrip("-")
+
+    target = file_path or "."
+    glob_pat = file_path or "*"
+    if gate == "dead_code":
+        suggested_cmd = (
+            f'python3 scripts/podo-guard.py codify --repo . --id {suggested_id} '
+            f'--cmd "ruff check --select F401,F841 {target}" '
+            f'--fix "Remove unused imports and dead code in {target}"'
+        )
+    elif gate == "no_comments":
+        suggested_cmd = (
+            f'python3 scripts/podo-guard.py codify --repo . --id {suggested_id} '
+            f'--regex "TODO|FIXME" --glob "{glob_pat}" '
+            f'--fix "Remove inline narration comments and untracked placeholders in {glob_pat}"'
+        )
+    elif gate == "verify_script":
+        suggested_cmd = (
+            f'python3 scripts/podo-guard.py codify --repo . --id {suggested_id} '
+            f'--cmd "bash .podo/verify.sh" '
+            f'--fix "Ensure .podo/verify.sh passes cleanly before finishing"'
+        )
+    else:
+        suggested_cmd = (
+            f'python3 scripts/podo-guard.py codify --repo . --id {suggested_id} '
+            f'--regex "<pattern>" --glob "{glob_pat}" '
+            f'--fix "Codify recurring {gate} check for {glob_pat}"'
+        )
+
+    return {
+        "gate": gate,
+        "file": file_path,
+        "count": count,
+        "suggested_id": suggested_id,
+        "suggested_cmd": suggested_cmd,
+    }
+
+
+def extract_event_timestamp(ev: dict[str, Any]) -> float | None:
+    """Extract POSIX epoch timestamp from a telemetry event's ts or iso_ts field."""
+    raw_ts = ev.get("ts")
+    if isinstance(raw_ts, (int, float)) and raw_ts > 0:
+        return float(raw_ts)
+    return parse_iso_timestamp(ev.get("iso_ts"))
+
+
+def event_matches_rule_id(ev: dict[str, Any], rule_id: str) -> bool:
+    """Return True if a telemetry failure event references the given check rule id."""
+    if not rule_id:
+        return False
+    if str(ev.get("check_id") or "").strip() == rule_id or str(ev.get("rule_id") or "").strip() == rule_id:
+        return True
+    raw_gate = str(ev.get("gate") or "").strip()
+    if raw_gate:
+        for chunk in raw_gate.split(","):
+            part = chunk.strip()
+            if part == rule_id:
+                return True
+            if ":" in part and part.split(":", 1)[1].strip() == rule_id:
+                return True
+    raw_violations = ev.get("violations")
+    if isinstance(raw_violations, list):
+        for v in raw_violations:
+            if rule_id in str(v):
+                return True
+    return False
+
+
+def analyze_rule_evolution(
+    repo: Path,
+    telemetry_paths: list[Path],
+    min_count: int = 3,
+    stale_days: int = 30,
+) -> dict[str, Any]:
+    """Analyze telemetry logs for recurring failure hotspots and stale codified rules."""
+    threshold = max(1, int(min_count))
+    window_days = max(1, int(stale_days))
+    events = read_merged_telemetry_events(telemetry_paths)
+
+    gate_run_events = [
+        ev
+        for ev in events
+        if str(ev.get("event") or "") in {"check", "hook_stop"}
+        and str(ev.get("result") or "") in {"pass", "fail", "observe"}
+    ]
+    failure_events = [
+        ev
+        for ev in gate_run_events
+        if str(ev.get("result") or "") in {"fail", "observe"}
+    ]
+
+    gate_counts: dict[str, int] = {}
+    gate_file_counts: dict[tuple[str, str], int] = {}
+    for ev in failure_events:
+        raw_gate = str(ev.get("gate") or "").strip()
+        gates = sorted({g.strip() for g in raw_gate.split(",") if g.strip()}) or ["check"]
+        raw_files = ev.get("files")
+        files = (
+            sorted({str(f).strip() for f in raw_files if isinstance(f, str) and str(f).strip()})
+            if isinstance(raw_files, list)
+            else []
+        )
+        for gate in gates:
+            gate_counts[gate] = gate_counts.get(gate, 0) + 1
+            for fp in files:
+                key = (gate, fp)
+                gate_file_counts[key] = gate_file_counts.get(key, 0) + 1
+
+    suggestions: list[dict[str, Any]] = []
+    gates_with_file_suggestion: set[str] = set()
+    for (gate, fp), count in sorted(gate_file_counts.items(), key=lambda item: (-item[1], item[0][0], item[0][1])):
+        if count >= threshold:
+            suggestions.append(build_evolution_suggestion(gate, fp, count))
+            gates_with_file_suggestion.add(gate)
+
+    for gate, count in sorted(gate_counts.items(), key=lambda item: (-item[1], item[0])):
+        if count >= threshold and gate not in gates_with_file_suggestion:
+            suggestions.append(build_evolution_suggestion(gate, "", count))
+
+    suggestions.sort(key=lambda item: (-int(item["count"]), str(item["gate"]), str(item["file"])))
+
+    stale_rules: list[dict[str, Any]] = []
+    checks_data = load_json_dict(repo / ".podo" / "checks.json")
+    checks = checks_data.get("checks", [])
+    if isinstance(checks, list) and checks:
+        cutoff_ts = time.time() - (window_days * 86400)
+        total_gate_runs = len(gate_run_events)
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            rule_id = str(item.get("id") or "unnamed-check").strip()
+            rule_type = str(item.get("type") or "").strip()
+            added_at = str(item.get("added_at") or "").strip()
+            added_ts = parse_iso_timestamp(added_at)
+
+            total_hits = 0
+            recent_hits = 0
+            for ev in failure_events:
+                if event_matches_rule_id(ev, rule_id):
+                    total_hits += 1
+                    ev_ts = extract_event_timestamp(ev)
+                    if ev_ts is None or ev_ts >= cutoff_ts:
+                        recent_hits += 1
+
+            is_old_rule = added_ts is not None and added_ts <= cutoff_ts
+            if recent_hits == 0 and (total_gate_runs >= threshold or len(failure_events) > 0 or is_old_rule):
+                reason = (
+                    f"0 failure hits across {total_gate_runs} gate run(s) within the last {window_days}d window"
+                    if total_hits == 0
+                    else f"0 failure hits within the last {window_days}d window ({total_hits} older hit(s))"
+                )
+                stale_rules.append(
+                    {
+                        "id": rule_id,
+                        "type": rule_type,
+                        "added_at": added_at,
+                        "hits": recent_hits,
+                        "stale_days": window_days,
+                        "reason": reason,
+                    }
+                )
+
+    return {
+        "total_events": len(events),
+        "failure_events": len(failure_events),
+        "min_count": threshold,
+        "stale_days": window_days,
+        "suggestions": suggestions,
+        "stale_rules": stale_rules,
+    }
+
+
+def format_evolve_report(report: dict[str, Any]) -> str:
+    """Format a rule evolution analysis report into concise human-readable terminal output."""
+    suggestions = report.get("suggestions", [])
+    stale_rules = report.get("stale_rules", [])
+    lines = [
+        "=== Podo Rule Evolution Report ===",
+        (
+            f"Events: total={report.get('total_events', 0)} "
+            f"failures={report.get('failure_events', 0)} "
+            f"min_count={report.get('min_count', 3)} "
+            f"stale_days={report.get('stale_days', 30)}"
+        ),
+    ]
+    if suggestions:
+        lines.append("Recurring Failure Suggestions:")
+        for item in suggestions:
+            scope = f"{item.get('gate', '')} ({item['file']})" if item.get("file") else str(item.get("gate", ""))
+            lines.append(f"  - [{item.get('suggested_id', '')}] {scope}: {item.get('count', 0)}x")
+            lines.append(f"    cmd: {item.get('suggested_cmd', '')}")
+    else:
+        lines.append("Recurring Failure Suggestions: none")
+
+    if stale_rules:
+        lines.append("Stale Rules:")
+        for rule in stale_rules:
+            lines.append(f"  - {rule.get('id', '')} ({rule.get('type') or 'unknown'}): {rule.get('reason', '')}")
+    else:
+        lines.append("Stale Rules: none")
+
+    return "\n".join(lines)
+
+
+def cmd_evolve(args: argparse.Namespace) -> int:
+    """Analyze telemetry failure hotspots and stale codified checks without creating .podo/."""
+    repo = Path(args.repo).resolve()
+    explicit_path = Path(args.telemetry_file).resolve() if args.telemetry_file else None
+    telemetry_paths = collect_telemetry_paths(explicit_path=explicit_path, repo=repo)
+    report = analyze_rule_evolution(
+        repo=repo,
+        telemetry_paths=telemetry_paths,
+        min_count=args.min_count,
+        stale_days=args.stale_days,
+    )
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(format_evolve_report(report))
+    return 0
+
+
 def handle_hook_stop(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     """Enforce deterministic no-comments, dead-code, and codified checks on Antigravity Stop hook."""
     t0 = time.monotonic()
@@ -3903,6 +4160,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_codify.add_argument("--fix", required=True, help="Actionable remediation message")
     p_codify.add_argument("--telemetry-file", help="Optional JSONL telemetry output path")
 
+    p_trust = sub.add_parser("trust", help="Approve the current SHA-256 hash of .podo/checks.json")
+    p_trust.add_argument("--repo", default=".", help="Repository path")
+
+    p_evolve = sub.add_parser("evolve", help="Analyze telemetry for recurring failures and stale checks")
+    p_evolve.add_argument("--repo", default=".", help="Repository path")
+    p_evolve.add_argument("--telemetry-file", help="Optional JSONL telemetry log path")
+    p_evolve.add_argument("--min-count", type=int, default=3, help="Minimum recurrence count for rule suggestions")
+    p_evolve.add_argument("--stale-days", type=int, default=30, help="Staleness lookback window in days")
+    p_evolve.add_argument("--json", action="store_true", help="Output report as JSON")
+
     p_dag = sub.add_parser("dag", help="Initialize or update live DAG state and artifacts")
     dag_sub = p_dag.add_subparsers(dest="dag_action", required=True)
 
@@ -3976,6 +4243,10 @@ def main() -> int:
         return cmd_check(args)
     if args.command == "codify":
         return cmd_codify(args)
+    if args.command == "trust":
+        return cmd_trust(args)
+    if args.command == "evolve":
+        return cmd_evolve(args)
     if args.command == "dag":
         return cmd_dag(args)
     if args.command == "telemetry":

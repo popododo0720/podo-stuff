@@ -5,8 +5,8 @@ description: >-
   /swarm without modifying built-in swarm internals. Automatically decomposes work
   into maximum-parallel DAG phases, runs zero-token deterministic checks per task,
   batches context-isolated interrogator verification once per DAG phase boundary,
-  supports cross-pool Arena bake-offs, and keeps an offline Gantt DAG dashboard
-  and observability telemetry synced.
+  supports cross-pool Arena bake-offs and 2x reject dynamic model escalation, and
+  keeps an offline Gantt DAG dashboard and observability telemetry synced.
 ---
 
 # Podo Swarm — Phased DAG Orchestrator
@@ -17,15 +17,23 @@ Do **not** modify any built-in Antigravity files. Always stay inside native `swa
 
 ---
 
-## Step 0: Load Active Role Models Dynamically
+## Step 0: Resolve `podo-guard.py` Portably & Load Active Role Models
 
-Read the active role-to-model mapping from `podo-config.json` before spawning any worker:
+Locate `podo-guard.py` portably (never hardcode a single install path) and read the effective configuration (bundled `podo-config.json` defaults merged with persistent user overrides in `$PLUGIN_DATA/podo-config.json` or `~/.config/podo-stuff/podo-config.json`):
 
 ```bash
-python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py config --show
+PODO_GUARD=""
+for candidate in \
+  "${PLUGIN_ROOT}/scripts/podo-guard.py" \
+  ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py \
+  ~/.gemini/antigravity-cli/plugins/podo-stuff/scripts/podo-guard.py \
+  ./scripts/podo-guard.py; do
+  if [ -f "$candidate" ]; then PODO_GUARD="$candidate"; break; fi
+done
+python3 "$PODO_GUARD" config --show
 ```
 
-Resolve every worker model strictly from the returned `roles` object (`roles.scout`, `roles.builder`, `roles.arena_a`, `roles.arena_b`, `roles.interrogator`, `roles.monitor`). Never hardcode model names or versions in briefs or swarm orchestration steps.
+Resolve every worker model strictly from the returned `roles` object (`roles.scout`, `roles.builder`, `roles.arena_a`, `roles.arena_b`, `roles.interrogator`, `roles.monitor`) and read escalation settings from `gates` (`gates.max_rejects_before_escalation`, `gates.escalation_role`). Never hardcode model names or versions in briefs or swarm orchestration steps.
 
 Record the starting commit reference before launching a Phase:
 
@@ -33,7 +41,7 @@ Record the starting commit reference before launching a Phase:
 BASE_SHA="$(git rev-parse HEAD)"
 ```
 
-Pass `BASE_SHA` explicitly into every `builder` and `interrogator` brief so committed branch changes in shared workspaces are always checked against the Phase base.
+Pass both `BASE_SHA` and the resolved `PODO_GUARD` path explicitly into every `builder` and `interrogator` brief so committed branch changes in shared workspaces are always checked against the Phase base.
 
 ---
 
@@ -51,7 +59,7 @@ Pass `BASE_SHA` explicitly into every `builder` and `interrogator` brief so comm
 4. **Initialize Live DAG Artifacts (`podo-dag.state.json` / `podo-dag.md` / `podo-dag.html`)**:
    - Use your conversation's artifact directory (`<appDataDir>/brain/<conversation-id>/`):
      ```bash
-     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py dag init \
+     python3 "$PODO_GUARD" dag init \
        --state-file "<artifact_dir>/podo-dag.state.json" \
        --md-out "<artifact_dir>/podo-dag.md" \
        --html-out "<artifact_dir>/podo-dag.html" \
@@ -73,7 +81,7 @@ Every `builder` (`model: <roles.builder>`, `workspace: "share"`) MUST follow the
 - Follow `no-comments` and `[DEAD-CODE]` rules (zero inline narration comments inside function bodies, zero unreachable code, zero unused imports or unused private helpers).
 - Before posting readiness, run the deterministic checker with `--base <BASE_SHA>` plus the target repository's own tests/typecheck/build for its slice. When `.podo/` telemetry is enabled (or `--telemetry-file` / `PODO_TELEMETRY_FILE` is set), tag the invocation with `--phase`, `--worker`, and `--role` (or export `PODO_PHASE`, `PODO_WORKER`, `PODO_ROLE`):
   ```bash
-  python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check \
+  python3 "$PODO_GUARD" check \
     --repo . --base <BASE_SHA> --phase phase-N --worker <worker-name> --role builder --run-verify
   ```
   (Plain `check` never auto-creates `.podo/` in clean repos unless `.podo/` already exists or `--telemetry-file` is passed.)
@@ -92,17 +100,28 @@ Add **one** `interrogator` (`model: <roles.interrogator>`, `workspace: "inherit"
     1. The explicit **task contract** (requirements and disjoint file boundaries),
     2. The actual **git diff** (`git diff <BASE_SHA>...HEAD` + working tree / untracked files) and deterministic check run:
        ```bash
-       python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py check \
+       python3 "$PODO_GUARD" check \
          --repo <workspace_or_repo> --base <BASE_SHA> --phase phase-N --worker interrogator --role interrogator --run-verify
        ```
     3. Direct **command/test execution proof** run against the target project's own checks.
   - Inspect all Phase `N` branches/diffs together for integration conflicts, edge cases, concurrency/state invariants, and missing assertions.
   - If a defect or recurring mistake is found:
     - Do **not** edit builder files yourself.
-    - Require a permanent structural fix — Type/API boundary tightening, a `.podo/checks.json` rule via `podo-guard.py codify --id ... --fix ...`, target project CI/linter rules, or a `specs/*.tla` TLA+ specification / property test for concurrency/state machines.
-    - Post `@<builder> [reject] <defect, reproduction, and required structural guardrail>` so only the responsible builder fixes and re-submits.
+    - Require a permanent structural fix — Type/API boundary tightening, a `.podo/checks.json` rule via `python3 "$PODO_GUARD" codify --id ... --fix ...`, target project CI/linter rules, or a `specs/*.tla` TLA+ specification / property test for concurrency/state machines.
+    - Post `@<builder> [reject] <defect, reproduction, and required structural guardrail>` so only the responsible builder fixes and re-submits (and include `@coordinator` if this reaches the 2nd consecutive `[reject]` for the same task).
   - When Phase `N` passes completely:
     - Post `@coordinator [phase-N-verified] <concise proof summary>` and end your turn.
+
+### Dynamic Model Escalation & Adaptive Replanning (2x `[reject]` Rule)
+Track consecutive `[reject]` counts per task across Phase `N` verification cycles (configured via `gates.max_rejects_before_escalation`, default `2`, and `gates.escalation_role`, default `"interrogator"`):
+- **1st `[reject]`**: The responsible `builder` fixes the defect in-place and resubmits `[phase-N-ready]` on its current model.
+- **2nd consecutive `[reject]` (`>= gates.max_rejects_before_escalation`)**: Do **not** loop a third time on the same model. `interrogator` wakes `@coordinator` alongside the `[reject]` report, and Coordinator chooses one of two interventions:
+  1. **In-Place Model Escalation**: Upgrade the stuck worker's model in-place (keeping its conversation history and workspace) via native `swarm`:
+     ```text
+     swarm{action: "model", name: "<builder>", model: "<roles[gates.escalation_role]>"}
+     ```
+     (e.g., escalating from `roles.builder` to `roles.interrogator` or `roles.arena_b`).
+  2. **Adaptive Replanning**: Switch that task to **Arena mode** (`roles.arena_a` vs `roles.arena_b`) or split the blocked DAG node into smaller disjoint sub-tasks before retrying.
 
 ---
 
@@ -113,7 +132,7 @@ Trigger **Arena mode** when the user writes `arena:`, asks to compare approaches
 1. Spawn two independent contenders with `workspace: "share"` on the exact same task brief and `BASE_SHA`:
    - `contender-a` (`model: <roles.arena_a>`)
    - `contender-b` (`model: <roles.arena_b>`)
-2. Require **both** contenders to pass Tier 1 (`podo-guard.py check --repo . --base <BASE_SHA> --role arena_a|arena_b --run-verify` + target project tests) before posting the compact contract line:
+2. Require **both** contenders to pass Tier 1 (`python3 "$PODO_GUARD" check --repo . --base <BASE_SHA> --role arena_a|arena_b --run-verify` + target project tests) before posting the compact contract line:
    ```text
    @interrogator [arena-ready] task=<task-id> branch=<branch> base=<BASE_SHA> cmd="<verify-cmd>" exit=0
    ```
@@ -132,27 +151,29 @@ Trigger **Arena mode** when the user writes `arena:`, asks to compare approaches
 3. **Restrict `dag update` to Phase Boundaries Using Batch `--set-nodes`**:
    - Do **not** invoke `dag update` on every individual micro-event. Update the DAG strictly at Phase boundaries (Phase start, `[reject]` cycle, or `[phase-N-verified]`) in a single batched call (which also records timestamps, durations, `interrogator_calls`, and re-renders the offline Gantt timeline + observability panel):
      ```bash
-     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py dag update \
+     python3 "$PODO_GUARD" dag update \
        --state-file "<artifact_dir>/podo-dag.state.json" \
        --set-nodes "task-1=verified,task-2=verified" \
        --phase "phase-1" --gate-status "verified" --note "<concise proof>"
      ```
    - Optional `--started-at` and `--finished-at` flags override auto-captured timestamps when needed.
    - Supported statuses: `pending`, `building`, `script_checked`, `arena_running`, `phase_interrogating`, `rejected`, `verified`.
-4. Merge shared workspaces (`git merge` / `cherry-pick` from verified worker branches) into the main workspace as each Phase completes, then kill finished workers only after their work is safely landed (never kill `monitor` early).
-5. Always end the creation turn (and status replies) with the exact `open_board` string returned by `swarm` on its own line, alongside a link to `[podo-dag.html](file://<artifact_dir>/podo-dag.html)`.
-6. When the final Phase passes:
+4. **Enforce 2x `[reject]` Escalation & Adaptive Replanning**:
+   - Track per-task `[reject]` counts across Phase cycles. On the 1st `[reject]`, allow the same `builder` to fix and resubmit. When a task reaches `>= gates.max_rejects_before_escalation` (default `2`) consecutive rejects, either escalate the waiting worker in-place via `swarm{action: "model", name: "<builder>", model: "<roles[gates.escalation_role]>"}` (e.g. `roles.interrogator` / `roles.arena_b`), or adaptively replan (switch the task to Arena mode or split the DAG node) and record the status transition in `dag update`.
+5. Merge shared workspaces (`git merge` / `cherry-pick` from verified worker branches) into the main workspace as each Phase completes, then kill finished workers only after their work is safely landed (never kill `monitor` early).
+6. Always end the creation turn (and status replies) with the exact `open_board` string returned by `swarm` on its own line, alongside a link to `[podo-dag.html](file://<artifact_dir>/podo-dag.html)`.
+7. When the final Phase passes:
    - Post `[done] <summary>` (with NO `@mention`) to quiet `monitor`.
-   - Run final `podo-guard.py check --repo . --base <BASE_SHA> --run-verify` on the merged workspace.
+   - Run final `python3 "$PODO_GUARD" check --repo . --base <BASE_SHA> --run-verify` on the merged workspace.
    - Generate the final observability report and session snapshot to review gate pass/fail breakdown, estimated role token usage, Tier-1 saved tokens, anomaly warnings, and `trace-index.json` links:
      ```bash
-     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py telemetry snapshot \
+     python3 "$PODO_GUARD" telemetry snapshot \
        --repo . \
        --state-file "<artifact_dir>/podo-dag.state.json" \
        --conversation-id "<conversation_id>" \
        --transcript-path "<artifact_dir>/.system_generated/logs/transcript.jsonl" \
        --artifact-dir "<artifact_dir>"
-     python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py telemetry report \
+     python3 "$PODO_GUARD" telemetry report \
        --repo . \
        --state-file "<artifact_dir>/podo-dag.state.json"
      ```

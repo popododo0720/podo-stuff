@@ -2,7 +2,7 @@
   "name": "podo-stuff",
   "displayName": "Podo Stuff",
   "description": "Deterministic code guardrails, dead-code checks, and phased parallel swarm workflows for Antigravity.",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "author": {
     "name": "popododo",
     "url": "https://github.com/popododo0720"

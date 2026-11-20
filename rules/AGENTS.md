@@ -17,7 +17,7 @@
    - Encode the fix permanently into the codebase structure:
      1. **Types & API Boundaries** (make invalid states unrepresentable).
      2. **Formal Verification (`specs/*.tla`)** / property tests for concurrency, locks, retries, or state machines.
-     3. **Codified Structural Checks**: register deterministic regex or required-command gates in the target repository's `.podo/checks.json` via `python3 ~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py codify ...`, or add project linters/CI checks.
+     3. **Codified Structural Checks**: register deterministic regex or required-command gates in the target repository's `.podo/checks.json` via `python3 "$PODO_GUARD" codify ...` (resolving `PODO_GUARD` from `${PLUGIN_ROOT}/scripts/podo-guard.py`, `~/.gemini/config/plugins/podo-stuff/scripts/podo-guard.py`, or `~/.gemini/antigravity-cli/plugins/podo-stuff/scripts/podo-guard.py`), and approve cloned repo `required_command` hashes with `python3 "$PODO_GUARD" trust --repo .`, or add project linters/CI checks.
 
 4. **Two-Tier Verification Cadence**:
    - **Tier 1 (Per `builder` Task — 0 LLM tokens)**: Run `podo-guard.py check --repo . --base <base_ref>` plus fast project-local tests after every `builder` task. Fix all script-gate failures before posting readiness.

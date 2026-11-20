@@ -147,5 +147,20 @@
     "input": "By the way, how do I check disk usage on Linux?",
     "expected": ["direct"],
     "expect_continuation": false
+  },
+  {
+    "id": "research-ko-paper-survey",
+    "input": "최근 2년간 LLM 추론 가속화(Speculative Decoding, KV Cache 압축, FlashAttention-3) 주요 논문들과 공식 벤치마크 결과를 교차 조사해서 출처 포함 리포트로 정리해줘",
+    "expected": ["research"]
+  },
+  {
+    "id": "research-en-competitive-arch",
+    "input": "Conduct a deep multi-source technical research survey comparing how Temporal, Restate, and DBOS implement durable execution, failure recovery, and throughput benchmarks with primary references.",
+    "expected": ["research"]
+  },
+  {
+    "id": "research-ko-benchmark-compare",
+    "input": "주요 벡터 DB(Qdrant, Milvus, pgvectorscale, Turbopuffer)의 10M+ 스케일 최신 공식 벤치마크, 비용 구조, 프로덕션 장애 사례를 심층 리서치해서 비교 보고서 만들어줘",
+    "expected": ["research"]
   }
 ]
