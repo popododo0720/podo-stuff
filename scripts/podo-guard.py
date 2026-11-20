@@ -2246,10 +2246,6 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Compute relative horizontal Gantt timing bars across the DAG session window."""
     phases = state.get("phases", [])
     timestamps: list[float] = []
-    for key in ("created_at", "updated_at"):
-        parsed = parse_iso_timestamp(state.get(key))
-        if parsed is not None:
-            timestamps.append(parsed)
     for ph in phases:
         for field in ("started_at", "finished_at"):
             parsed = parse_iso_timestamp(ph.get(field))
@@ -2260,6 +2256,11 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
                 parsed = parse_iso_timestamp(node.get(field))
                 if parsed is not None:
                     timestamps.append(parsed)
+    if not timestamps:
+        for key in ("created_at", "updated_at"):
+            parsed = parse_iso_timestamp(state.get(key))
+            if parsed is not None:
+                timestamps.append(parsed)
 
     window_start = min(timestamps) if timestamps else 0.0
     window_end = max(timestamps) if timestamps else 1.0
@@ -2274,6 +2275,7 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
         finished_at: str | None,
         duration_s: float | None,
         worker: str = "",
+        title: str = "",
     ) -> dict[str, Any]:
         t_start = parse_iso_timestamp(started_at)
         t_end = parse_iso_timestamp(finished_at)
@@ -2292,6 +2294,7 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
             "kind": kind,
             "id": row_id,
             "label": label,
+            "title": title,
             "worker": worker,
             "status": status,
             "started_at": started_at or "-",
@@ -2316,21 +2319,24 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
                 ph.get("finished_at"),
                 ph.get("duration_s"),
                 worker="",
+                title="",
             )
         )
         for node in ph.get("nodes", []):
             worker_name = str(node.get("worker") or "")
+            node_title = str(node.get("title") or "")
             worker_suffix = f" (@{worker_name})" if worker_name else ""
             rows.append(
                 make_row(
                     "node",
                     str(node.get("id") or ""),
-                    f"{node.get('id')}: {node.get('title')}{worker_suffix}",
+                    f"{node.get('id')}: {node_title}{worker_suffix}",
                     str(node.get("status") or "pending"),
                     node.get("started_at"),
                     node.get("finished_at"),
                     node.get("duration_s"),
                     worker=worker_name,
+                    title=node_title,
                 )
             )
     return rows
@@ -2592,19 +2598,22 @@ def render_dag_html(
                 else '<span class="gantt-tag">TASK</span>'
             )
         )
+        head_label = row["label"] if is_phase else row["id"]
+        sub_html = f'<div class="gantt-sub muted">{html.escape(row["title"])}</div>' if row.get("title") else ""
         gantt_rows_html.append(
             f"""
             <div class="{item_cls}">
               <div class="gantt-head">
                 <div class="gantt-title-wrap">
                   {tag_html}
-                  <span class="gantt-label">{html.escape(row["label"])}</span>
+                  <span class="gantt-label">{html.escape(head_label)}</span>
                 </div>
                 <div class="gantt-meta">
                   <span class="gantt-range mono muted" title="{html.escape(row["full_range"])}">{html.escape(row["compact_range"])}</span>
                   <span class="dur-pill mono">{html.escape(row["duration_label"])}</span>
                 </div>
               </div>
+              {sub_html}
               <div class="gantt-track" aria-label="Timeline window">
                 {bar_html}
               </div>
@@ -2884,7 +2893,7 @@ def render_dag_html(
       gap: 8px;
       font-size: 12px;
     }}
-    .gantt-title-wrap {{ display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 220px; }}
+    .gantt-title-wrap {{ display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 180px; }}
     .gantt-tag {{
       flex-shrink: 0;
       padding: 2px 6px;
@@ -2897,6 +2906,7 @@ def render_dag_html(
     }}
     .gantt-tag-phase {{ color: var(--primary); }}
     .gantt-label {{ color: var(--foreground); font-weight: 500; word-break: break-word; }}
+    .gantt-sub {{ font-size: 12px; line-height: 1.45; word-break: break-word; }}
     .gantt-meta {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
     .gantt-range {{ font-size: 11px; white-space: nowrap; }}
     .gantt-track {{
@@ -2952,7 +2962,8 @@ def render_dag_html(
     .share-legend {{ display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; }}
     .legend-chip {{ display: inline-flex; align-items: center; gap: 5px; }}
     .legend-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
-    .obs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
+    .obs-stack {{ display: flex; flex-direction: column; gap: 12px; }}
+    .obs-table-wrap {{ width: 100%; overflow-x: auto; }}
     .obs-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
     .obs-table th, .obs-table td {{
       text-align: left;
@@ -3049,8 +3060,8 @@ def render_dag_html(
           </div>
         </div>
         {share_bar_html}
-        <div class="obs-grid">
-          <div>
+        <div class="obs-stack">
+          <div class="obs-table-wrap">
             <table class="obs-table">
               <thead>
                 <tr><th>Role</th><th class="num">Calls</th><th class="num">Avg/Call</th><th class="num">Est. Tokens</th><th class="num">Share</th></tr>

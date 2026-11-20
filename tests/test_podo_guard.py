@@ -1429,9 +1429,13 @@ class ObservabilityTests(unittest.TestCase):
             html_text = html_path.read_text(encoding="utf-8")
             self.assertIn("gantt-item", html_text)
             self.assertIn("gantt-head", html_text)
+            self.assertIn("gantt-sub", html_text)
             self.assertIn("gantt-track", html_text)
+            self.assertIn("obs-stack", html_text)
             self.assertIn("share-bar", html_text)
             self.assertIn("2m 05s", html_text)
+            self.assertIn("width: 100.0%", html_text)
+            self.assertNotIn("(@builder-1)", html_text)
             self.assertNotIn("https://", html_text)
 
 
