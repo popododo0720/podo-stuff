@@ -1350,6 +1350,90 @@ class ObservabilityTests(unittest.TestCase):
             self.assertIn("1 (1 pass / 0 fail)", html_text)
             self.assertIn("scout", html_text)
 
+    def test_format_duration_and_batch_update_backfills_created_at_with_stacked_gantt(self) -> None:
+        self.assertEqual(GUARD.format_duration_s(12.5), "12.5s")
+        self.assertEqual(GUARD.format_duration_s(125.0), "2m 05s")
+        self.assertEqual(GUARD.format_duration_s(3900.0), "1h 05m")
+        self.assertEqual(
+            GUARD.format_compact_time_range("2026-11-20T05:45:01Z", "2026-11-20T06:03:36Z"),
+            "05:45:01 → 06:03:36 UTC",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_path = root / "podo-config.json"
+            GUARD.save_config(GUARD.default_config(), cfg_path)
+            state_path = root / "podo-dag.state.json"
+            html_path = root / "podo-dag.html"
+
+            state = {
+                "title": "Backfill Test",
+                "created_at": "2026-11-20T05:00:00Z",
+                "updated_at": "2026-11-20T05:00:00Z",
+                "html_out": str(html_path),
+                "phases": [
+                    {
+                        "id": "phase-1",
+                        "name": "Phase 1: Backfill",
+                        "gate_status": "pending",
+                        "started_at": None,
+                        "finished_at": None,
+                        "duration_s": None,
+                        "interrogator_calls": 0,
+                        "nodes": [
+                            {
+                                "id": "t1",
+                                "title": "Pending Task",
+                                "worker": "builder-1",
+                                "role": "builder",
+                                "status": "pending",
+                                "started_at": None,
+                                "finished_at": None,
+                                "duration_s": None,
+                            }
+                        ],
+                    }
+                ],
+            }
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            upd_proc = run_cli(
+                [
+                    "--config",
+                    str(cfg_path),
+                    "dag",
+                    "update",
+                    "--state-file",
+                    str(state_path),
+                    "--phase",
+                    "phase-1",
+                    "--gate-status",
+                    "verified",
+                    "--set-nodes",
+                    "t1=verified",
+                    "--finished-at",
+                    "2026-11-20T05:02:05Z",
+                ]
+            )
+            self.assertEqual(upd_proc.returncode, 0, upd_proc.stderr)
+
+            updated = json.loads(state_path.read_text(encoding="utf-8"))
+            ph = updated["phases"][0]
+            node = ph["nodes"][0]
+            self.assertEqual(node["started_at"], "2026-11-20T05:00:00Z")
+            self.assertEqual(node["finished_at"], "2026-11-20T05:02:05Z")
+            self.assertEqual(node["duration_s"], 125.0)
+            self.assertEqual(ph["started_at"], "2026-11-20T05:00:00Z")
+            self.assertEqual(ph["duration_s"], 125.0)
+
+            html_text = html_path.read_text(encoding="utf-8")
+            self.assertIn("gantt-item", html_text)
+            self.assertIn("gantt-head", html_text)
+            self.assertIn("gantt-track", html_text)
+            self.assertIn("share-bar", html_text)
+            self.assertIn("2m 05s", html_text)
+            self.assertNotIn("https://", html_text)
+
 
 if __name__ == "__main__":
     unittest.main()

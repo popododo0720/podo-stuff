@@ -1380,10 +1380,39 @@ def compute_duration_s(started_at: str | None, finished_at: str | None) -> float
 
 
 def format_duration_s(duration_s: float | None) -> str:
-    """Format duration in seconds into a compact display label."""
+    """Format duration in seconds into a compact human-readable label."""
     if duration_s is None:
         return "-"
-    return f"{duration_s:.1f}s"
+    if duration_s < 60.0:
+        return f"{duration_s:.1f}s"
+    total_sec = int(round(duration_s))
+    if total_sec < 3600:
+        mins, secs = divmod(total_sec, 60)
+        return f"{mins}m {secs:02d}s"
+    hours, rem = divmod(total_sec, 3600)
+    return f"{hours}h {rem // 60:02d}m"
+
+
+def format_compact_time_range(started_at: str | None, finished_at: str | None) -> str:
+    """Format ISO start/finish timestamps compactly while keeping date when bounds cross midnight."""
+    if not started_at and not finished_at:
+        return "-"
+
+    def split_iso(ts: str | None) -> tuple[str, str]:
+        if not ts:
+            return "", "…"
+        text = ts.strip()
+        if "T" in text:
+            date_part, rest = text.split("T", 1)
+            time_part = rest.rstrip("Z").split("+", 1)[0].split(".", 1)[0]
+            return date_part, time_part
+        return "", text
+
+    d_start, t_start = split_iso(started_at)
+    d_end, t_end = split_iso(finished_at)
+    if d_start and d_end and d_start != d_end:
+        return f"{d_start[5:]} {t_start} → {d_end[5:]} {t_end} UTC"
+    return f"{t_start} → {t_end} UTC"
 
 
 def sanitize_identifier(raw: str) -> str:
@@ -2131,6 +2160,7 @@ def apply_status_timestamps(
     now: str,
     started_override: str | None = None,
     finished_override: str | None = None,
+    fallback_started_at: str | None = None,
 ) -> None:
     """Update started_at, finished_at, and duration_s on a DAG phase or node."""
     if started_override:
@@ -2140,13 +2170,13 @@ def apply_status_timestamps(
 
     if status in ACTIVE_DAG_STATUSES:
         if not item.get("started_at"):
-            item["started_at"] = now
+            item["started_at"] = fallback_started_at or now
         if not finished_override:
             item["finished_at"] = None
             item["duration_s"] = None
     elif status in TERMINAL_DAG_STATUSES:
         if not item.get("started_at"):
-            item["started_at"] = now
+            item["started_at"] = fallback_started_at or now
         if not item.get("finished_at"):
             item["finished_at"] = now
 
@@ -2243,6 +2273,7 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
         started_at: str | None,
         finished_at: str | None,
         duration_s: float | None,
+        worker: str = "",
     ) -> dict[str, Any]:
         t_start = parse_iso_timestamp(started_at)
         t_end = parse_iso_timestamp(finished_at)
@@ -2261,9 +2292,12 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
             "kind": kind,
             "id": row_id,
             "label": label,
+            "worker": worker,
             "status": status,
             "started_at": started_at or "-",
             "finished_at": finished_at or "-",
+            "compact_range": format_compact_time_range(started_at, finished_at),
+            "full_range": f"{started_at or '-'} → {finished_at or '-'}",
             "duration_s": resolved_dur,
             "duration_label": format_duration_s(resolved_dur),
             "left_pct": left_pct,
@@ -2281,19 +2315,22 @@ def compute_gantt_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
                 ph.get("started_at"),
                 ph.get("finished_at"),
                 ph.get("duration_s"),
+                worker="",
             )
         )
         for node in ph.get("nodes", []):
-            worker = f" (@{node['worker']})" if node.get("worker") else ""
+            worker_name = str(node.get("worker") or "")
+            worker_suffix = f" (@{worker_name})" if worker_name else ""
             rows.append(
                 make_row(
                     "node",
                     str(node.get("id") or ""),
-                    f"{node.get('id')}: {node.get('title')}{worker}",
+                    f"{node.get('id')}: {node.get('title')}{worker_suffix}",
                     str(node.get("status") or "pending"),
                     node.get("started_at"),
                     node.get("finished_at"),
                     node.get("duration_s"),
+                    worker=worker_name,
                 )
             )
     return rows
@@ -2452,15 +2489,11 @@ def render_dag_html(
     verified_nodes = sum(
         1 for ph in phases for n in ph.get("nodes", []) if n.get("status") == "verified"
     )
-    active_nodes = sum(
-        1
-        for ph in phases
-        for n in ph.get("nodes", [])
-        if n.get("status") in ACTIVE_DAG_STATUSES
-    )
     rejected_nodes = sum(
         1 for ph in phases for n in ph.get("nodes", []) if n.get("status") == "rejected"
     )
+    dag_summary = obs.get("dag_summary", {})
+    total_duration_label = format_duration_s(dag_summary.get("total_duration_s"))
 
     phase_cards_html: list[str] = []
     for ph in phases:
@@ -2493,18 +2526,16 @@ def render_dag_html(
                 f"""
                 <div class="node-card">
                   <div class="node-top">
-                    <div>
+                    <div class="min-w-0">
                       <div class="node-id">{html.escape(node["id"])}</div>
                       <div class="node-title">{html.escape(node["title"])}</div>
                     </div>
-                    <span class="badge {st_cls}">{html.escape(st_label)}</span>
+                    <span class="badge {st_cls}"><span class="dot"></span>{html.escape(st_label)}</span>
                   </div>
                   <div class="node-meta">
-                    <span class="meta-worker">@{html.escape(node.get("worker") or "unassigned")}</span>
-                    <span>·</span>
-                    <span class="mono">{html.escape(node.get("model") or "inherit")}</span>
-                    <span>·</span>
-                    <span class="mono">{html.escape(dur_str)}</span>
+                    <span class="meta-pill meta-worker">@{html.escape(node.get("worker") or "unassigned")}</span>
+                    <span class="meta-pill mono">{html.escape(node.get("model") or "inherit")}</span>
+                    <span class="meta-pill mono">{html.escape(dur_str)}</span>
                   </div>
                   {chips_row}
                   {note_html}
@@ -2513,7 +2544,7 @@ def render_dag_html(
             )
 
         gate_note_html = (
-            f'<div class="gate-note">Gate Note: {html.escape(ph["gate_note"])}</div>'
+            f'<div class="gate-note">{html.escape(ph["gate_note"])}</div>'
             if ph.get("gate_note")
             else ""
         )
@@ -2526,11 +2557,11 @@ def render_dag_html(
                 <div class="phase-title-group">
                   <span class="phase-id">{html.escape(ph["id"])}</span>
                   <h2 class="phase-name">{html.escape(ph["name"])}</h2>
-                  <span class="muted mono">{html.escape(ph_dur_str)}</span>
+                  <span class="dur-pill mono">{html.escape(ph_dur_str)}</span>
                 </div>
                 <div class="gate-group">
-                  <span class="muted">Interrogator Gate ({html.escape(interrogator_model)} · {ph_calls}x):</span>
-                  <span class="badge {gate_cls}">{html.escape(gate_label)}</span>
+                  <span class="muted">Interrogator Gate ({html.escape(interrogator_model)} · {ph_calls}x)</span>
+                  <span class="badge {gate_cls}"><span class="dot"></span>{html.escape(gate_label)}</span>
                 </div>
               </div>
               <div class="nodes-grid">
@@ -2544,21 +2575,38 @@ def render_dag_html(
     gantt_rows = compute_gantt_rows(state)
     gantt_rows_html: list[str] = []
     for row in gantt_rows:
-        row_cls = "gantt-row gantt-phase" if row["kind"] == "phase" else "gantt-row gantt-node"
+        is_phase = row["kind"] == "phase"
+        item_cls = "gantt-item gantt-phase" if is_phase else "gantt-item gantt-node"
         bar_color = gantt_bar_color_var(row["status"])
         bar_html = (
             f'<div class="gantt-bar" style="left: {row["left_pct"]}%; width: {row["width_pct"]}%; background: {bar_color};"></div>'
             if row["width_pct"] > 0
             else '<div class="gantt-bar-empty"></div>'
         )
+        tag_html = (
+            '<span class="gantt-tag gantt-tag-phase">PHASE</span>'
+            if is_phase
+            else (
+                f'<span class="gantt-tag">@{html.escape(row["worker"])}</span>'
+                if row.get("worker")
+                else '<span class="gantt-tag">TASK</span>'
+            )
+        )
         gantt_rows_html.append(
             f"""
-            <div class="{row_cls}">
-              <div class="gantt-label">{html.escape(row["label"])}</div>
-              <div class="gantt-track">{bar_html}</div>
-              <div class="gantt-timing mono">
-                <span>{html.escape(row["duration_label"])}</span>
-                <span class="muted">{html.escape(row["started_at"])} → {html.escape(row["finished_at"])}</span>
+            <div class="{item_cls}">
+              <div class="gantt-head">
+                <div class="gantt-title-wrap">
+                  {tag_html}
+                  <span class="gantt-label">{html.escape(row["label"])}</span>
+                </div>
+                <div class="gantt-meta">
+                  <span class="gantt-range mono muted" title="{html.escape(row["full_range"])}">{html.escape(row["compact_range"])}</span>
+                  <span class="dur-pill mono">{html.escape(row["duration_label"])}</span>
+                </div>
+              </div>
+              <div class="gantt-track" aria-label="Timeline window">
+                {bar_html}
               </div>
             </div>
             """
@@ -2566,23 +2614,58 @@ def render_dag_html(
 
     tok_est = obs.get("token_estimates", {})
     by_role = tok_est.get("by_role", {})
+    total_estimated = int(tok_est.get("total_estimated_tokens", 0))
+    tier1_saved = int(tok_est.get("tier1_saved_tokens", 0))
     anomalies = tok_est.get("anomalies", [])
     gate_metrics = obs.get("gate_metrics", {})
 
+    role_colors = {
+        "builder": "var(--primary)",
+        "interrogator": "var(--warning)",
+        "scout": "var(--success)",
+        "arena_a": "var(--primary)",
+        "arena_b": "var(--secondary-foreground)",
+        "monitor": "var(--muted-foreground)",
+    }
+
+    role_share_segments: list[str] = []
+    role_legend_items: list[str] = []
     role_rows_html: list[str] = []
     for role_name, info in sorted(by_role.items()):
+        est_tok = int(info.get("estimated_tokens", 0))
+        share_pct = (est_tok / total_estimated * 100.0) if total_estimated > 0 else 0.0
+        seg_color = role_colors.get(role_name, "var(--secondary-foreground)")
+        if share_pct > 0:
+            role_share_segments.append(
+                f'<div class="share-seg" style="width: {share_pct:.2f}%; background: {seg_color};" title="{html.escape(role_name)}: {share_pct:.1f}%"></div>'
+            )
+        role_legend_items.append(
+            f'<span class="legend-chip"><span class="legend-dot" style="background: {seg_color};"></span><span class="mono">{html.escape(role_name)}</span> <span class="muted mono">{share_pct:.0f}%</span></span>'
+        )
         role_rows_html.append(
             f"""
             <tr>
               <td class="mono">{html.escape(role_name)}</td>
-              <td class="mono">{int(info.get("calls", 0))}</td>
-              <td class="mono">{int(info.get("avg_tokens", 0)):,}</td>
-              <td class="mono">{int(info.get("estimated_tokens", 0)):,}</td>
+              <td class="mono num">{int(info.get("calls", 0))}</td>
+              <td class="mono num">{int(info.get("avg_tokens", 0)):,}</td>
+              <td class="mono num">{est_tok:,}</td>
+              <td class="mono num muted">{share_pct:.1f}%</td>
             </tr>
             """
         )
     if not role_rows_html:
-        role_rows_html.append('<tr><td colspan="4" class="muted">No role invocations recorded yet.</td></tr>')
+        role_rows_html.append('<tr><td colspan="5" class="muted">No role invocations recorded yet.</td></tr>')
+
+    share_bar_html = (
+        f"""
+        <div class="share-wrap">
+          <div class="share-bar">{"".join(role_share_segments)}</div>
+          <div class="share-legend">{"".join(role_legend_items)}</div>
+        </div>
+        """
+        if role_share_segments
+        else ""
+    )
 
     if anomalies:
         anomalies_html = "".join(
@@ -2600,13 +2683,13 @@ def render_dag_html(
   <style>
     :root {{
       --background: #0f1117;
-      --card: #171a23;
+      --card: #161922;
       --foreground: #e6e8ef;
-      --muted-foreground: #9aa2b2;
-      --border: #2a3040;
-      --card-border: #252b3b;
+      --muted-foreground: #949dae;
+      --border: #272d3d;
+      --card-border: #222736;
       --primary: #5b9cf6;
-      --secondary: #222838;
+      --secondary: #202636;
       --secondary-foreground: #cfd6e6;
       --success: #34d399;
       --warning: #fbbf24;
@@ -2615,7 +2698,7 @@ def render_dag_html(
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      padding: 20px;
+      padding: 16px;
       background: var(--background);
       color: var(--foreground);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -2624,39 +2707,57 @@ def render_dag_html(
     }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }}
     .muted {{ color: var(--muted-foreground); }}
-    .page {{ max-width: 1200px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }}
+    .min-w-0 {{ min-width: 0; }}
+    .page {{ max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }}
     .header-card, .phase-card, .panel-card {{
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 12px;
       padding: 16px;
     }}
-    .header-card {{
+    .header-top {{
       display: flex;
       flex-wrap: wrap;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
-      gap: 16px;
+      gap: 10px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--card-border);
     }}
     .eyebrow {{
       font-size: 11px;
       font-weight: 600;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.06em;
       color: var(--primary);
     }}
-    .page-title {{ margin: 4px 0 0; font-size: 18px; font-weight: 600; color: var(--foreground); }}
+    .page-title {{ margin: 4px 0 0; font-size: 17px; font-weight: 600; color: var(--foreground); }}
     .subtitle {{ margin-top: 4px; font-size: 12px; color: var(--muted-foreground); }}
-    .stats {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font-size: 12px; }}
-    .stat-pill {{
-      padding: 6px 12px;
-      border-radius: 8px;
-      background: var(--background);
-      border: 1px solid var(--border);
+    .kpi-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin-top: 12px;
     }}
-    .stat-value {{ font-weight: 600; margin-left: 4px; color: var(--foreground); }}
-    .stat-primary {{ color: var(--primary); }}
-    .stat-success {{ color: var(--success); }}
-    .stat-error {{ color: var(--error); }}
+    .kpi-card {{
+      padding: 10px 12px;
+      border-radius: 10px;
+      background: var(--background);
+      border: 1px solid var(--card-border);
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }}
+    .kpi-label {{
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--muted-foreground);
+    }}
+    .kpi-val {{ font-size: 16px; font-weight: 600; color: var(--foreground); }}
+    .kpi-primary {{ color: var(--primary); }}
+    .kpi-success {{ color: var(--success); }}
+    .kpi-error {{ color: var(--error); }}
     .phase-card, .panel-card {{ display: flex; flex-direction: column; gap: 12px; }}
     .phase-header, .panel-header {{
       display: flex;
@@ -2667,25 +2768,33 @@ def render_dag_html(
       padding-bottom: 10px;
       border-bottom: 1px solid var(--card-border);
     }}
-    .phase-title-group, .gate-group {{ display: flex; align-items: center; gap: 8px; font-size: 12px; }}
+    .phase-title-group, .gate-group {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }}
     .phase-id {{
       padding: 2px 8px;
       border-radius: 6px;
       background: var(--secondary);
       color: var(--secondary-foreground);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12px;
+      font-size: 11px;
     }}
     .phase-name, .panel-title {{ margin: 0; font-size: 14px; font-weight: 600; color: var(--foreground); }}
+    .dur-pill {{
+      padding: 2px 8px;
+      border-radius: 6px;
+      background: var(--secondary);
+      color: var(--secondary-foreground);
+      font-size: 11px;
+      font-weight: 600;
+    }}
     .nodes-grid {{
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
     }}
     .node-card {{
       background: var(--background);
       border: 1px solid var(--card-border);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 12px;
       display: flex;
       flex-direction: column;
@@ -2698,8 +2807,14 @@ def render_dag_html(
       color: var(--muted-foreground);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }}
-    .node-title {{ font-size: 14px; font-weight: 500; color: var(--foreground); margin-top: 2px; }}
-    .node-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--muted-foreground); }}
+    .node-title {{ font-size: 13px; font-weight: 500; color: var(--foreground); margin-top: 2px; }}
+    .node-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 11px; color: var(--muted-foreground); }}
+    .meta-pill {{
+      padding: 2px 6px;
+      border-radius: 5px;
+      background: var(--card);
+      border: 1px solid var(--card-border);
+    }}
     .meta-worker {{
       color: var(--foreground);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -2717,11 +2832,16 @@ def render_dag_html(
     .gate-note {{
       font-size: 12px;
       color: var(--muted-foreground);
-      padding-top: 8px;
-      border-top: 1px solid var(--card-border);
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--background);
+      border: 1px solid var(--card-border);
     }}
     .badge {{
       flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
       padding: 2px 8px;
       border-radius: 999px;
       border: 1px solid var(--border);
@@ -2729,6 +2849,7 @@ def render_dag_html(
       font-weight: 500;
       color: var(--muted-foreground);
     }}
+    .dot {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
     .badge-pending {{ border-color: var(--border); color: var(--muted-foreground); }}
     .badge-building {{ border-color: var(--primary); color: var(--primary); }}
     .badge-script {{ border-color: var(--primary); color: var(--primary); }}
@@ -2736,43 +2857,112 @@ def render_dag_html(
     .badge-interrogating {{ border-color: var(--warning); color: var(--warning); }}
     .badge-rejected {{ border-color: var(--error); color: var(--error); }}
     .badge-verified {{ border-color: var(--success); color: var(--success); }}
-    .gantt-list {{ display: flex; flex-direction: column; gap: 8px; }}
-    .gantt-row {{
-      display: grid;
-      grid-template-columns: minmax(180px, 240px) 1fr minmax(180px, 290px);
-      align-items: center;
-      gap: 12px;
-      font-size: 12px;
+    .gantt-ruler {{
+      display: flex;
+      justify-content: space-between;
+      font-size: 10px;
+      color: var(--muted-foreground);
+      padding: 0 2px;
     }}
-    .gantt-phase .gantt-label {{ font-weight: 600; color: var(--foreground); }}
-    .gantt-node .gantt-label {{ padding-left: 14px; color: var(--muted-foreground); }}
-    .gantt-track {{
-      position: relative;
-      height: 16px;
-      border-radius: 999px;
+    .gantt-list {{ display: flex; flex-direction: column; gap: 10px; }}
+    .gantt-item {{
       background: var(--background);
       border: 1px solid var(--card-border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }}
+    .gantt-phase {{ border-left: 3px solid var(--primary); }}
+    .gantt-node {{ margin-left: 12px; }}
+    .gantt-head {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 12px;
+    }}
+    .gantt-title-wrap {{ display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 220px; }}
+    .gantt-tag {{
+      flex-shrink: 0;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: var(--secondary);
+      color: var(--secondary-foreground);
+      font-size: 10px;
+      font-weight: 600;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }}
+    .gantt-tag-phase {{ color: var(--primary); }}
+    .gantt-label {{ color: var(--foreground); font-weight: 500; word-break: break-word; }}
+    .gantt-meta {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
+    .gantt-range {{ font-size: 11px; white-space: nowrap; }}
+    .gantt-track {{
+      position: relative;
+      width: 100%;
+      height: 12px;
+      border-radius: 999px;
+      background-color: var(--card);
+      background-image: linear-gradient(
+        to right,
+        transparent 24.7%,
+        var(--border) 25%,
+        transparent 25.3%,
+        transparent 49.7%,
+        var(--border) 50%,
+        transparent 50.3%,
+        transparent 74.7%,
+        var(--border) 75%,
+        transparent 75.3%
+      );
+      border: 1px solid var(--border);
       overflow: hidden;
     }}
     .gantt-bar {{
       position: absolute;
-      top: 2px;
-      bottom: 2px;
+      top: 1px;
+      bottom: 1px;
       border-radius: 999px;
-      opacity: 0.9;
+      opacity: 0.92;
     }}
     .gantt-bar-empty {{ height: 100%; }}
-    .gantt-timing {{ display: flex; flex-direction: column; align-items: flex-end; font-size: 11px; }}
-    .obs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }}
+    .stats {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }}
+    .stat-pill {{
+      padding: 5px 10px;
+      border-radius: 8px;
+      background: var(--background);
+      border: 1px solid var(--border);
+    }}
+    .stat-value {{ font-weight: 600; margin-left: 4px; color: var(--foreground); }}
+    .stat-success {{ color: var(--success); }}
+    .share-wrap {{ display: flex; flex-direction: column; gap: 8px; }}
+    .share-bar {{
+      display: flex;
+      width: 100%;
+      height: 10px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: var(--background);
+      border: 1px solid var(--card-border);
+      gap: 2px;
+    }}
+    .share-seg {{ height: 100%; }}
+    .share-legend {{ display: flex; flex-wrap: wrap; gap: 10px; font-size: 11px; }}
+    .legend-chip {{ display: inline-flex; align-items: center; gap: 5px; }}
+    .legend-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
+    .obs-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
     .obs-table {{ width: 100%; border-collapse: collapse; font-size: 12px; }}
     .obs-table th, .obs-table td {{
       text-align: left;
-      padding: 6px 8px;
+      padding: 7px 8px;
       border-bottom: 1px solid var(--card-border);
     }}
-    .obs-table th {{ color: var(--muted-foreground); font-weight: 500; }}
+    .obs-table th.num, .obs-table td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+    .obs-table th {{ color: var(--muted-foreground); font-weight: 500; font-size: 11px; }}
     .alert-item {{
-      padding: 8px 10px;
+      padding: 10px 12px;
       border-radius: 8px;
       border: 1px solid var(--warning);
       background: var(--background);
@@ -2781,7 +2971,7 @@ def render_dag_html(
       margin-bottom: 6px;
     }}
     .alert-ok {{
-      padding: 8px 10px;
+      padding: 10px 12px;
       border-radius: 8px;
       border: 1px solid var(--success);
       background: var(--background);
@@ -2793,27 +2983,37 @@ def render_dag_html(
 <body>
   <div class="page">
     <header class="header-card">
-      <div>
-        <div class="eyebrow mono">PODO-STUFF · PHASED DAG ORCHESTRATOR</div>
-        <h1 class="page-title">{html.escape(state["title"])}</h1>
-        <div class="subtitle">
-          Tier 1: Per-Task Deterministic Script (0 tokens) · Tier 2: Per-Phase Interrogator Gate ({html.escape(interrogator_model)})
+      <div class="header-top">
+        <div>
+          <div class="eyebrow mono">PODO-STUFF · PHASED DAG ORCHESTRATOR</div>
+          <h1 class="page-title">{html.escape(state["title"])}</h1>
+          <div class="subtitle">
+            Tier 1: Per-Task Deterministic Script (0 tokens) · Tier 2: Per-Phase Interrogator Gate ({html.escape(interrogator_model)})
+          </div>
         </div>
+        <div class="muted mono" style="font-size:11px;">Updated {html.escape(state["updated_at"])}</div>
       </div>
-      <div class="stats">
-        <div class="stat-pill">
-          <span class="muted">Tasks:</span>
-          <span class="stat-value mono">{verified_nodes}/{total_nodes}</span>
+      <div class="kpi-grid">
+        <div class="kpi-card">
+          <span class="kpi-label">Tasks Verified</span>
+          <span class="kpi-val mono">{verified_nodes}/{total_nodes}</span>
         </div>
-        <div class="stat-pill">
-          <span class="muted">Active:</span>
-          <span class="stat-value stat-primary mono">{active_nodes}</span>
+        <div class="kpi-card">
+          <span class="kpi-label">Total Duration</span>
+          <span class="kpi-val kpi-primary mono">{html.escape(total_duration_label)}</span>
         </div>
-        <div class="stat-pill">
-          <span class="muted">Rejected:</span>
-          <span class="stat-value stat-error mono">{rejected_nodes}</span>
+        <div class="kpi-card">
+          <span class="kpi-label">Estimated Tokens</span>
+          <span class="kpi-val mono">{total_estimated:,}</span>
         </div>
-        <div class="muted mono">Updated: {html.escape(state["updated_at"])}</div>
+        <div class="kpi-card">
+          <span class="kpi-label">Tier-1 Saved</span>
+          <span class="kpi-val kpi-success mono">{tier1_saved:,}</span>
+        </div>
+        <div class="kpi-card">
+          <span class="kpi-label">Rejected</span>
+          <span class="kpi-val kpi-error mono">{rejected_nodes}</span>
+        </div>
       </div>
     </header>
     <main class="page">
@@ -2821,7 +3021,10 @@ def render_dag_html(
       <section class="panel-card">
         <div class="panel-header">
           <h2 class="panel-title">Phase &amp; Worker Timeline (Gantt View)</h2>
-          <span class="muted mono">{len(gantt_rows)} items</span>
+          <span class="muted mono" style="font-size:11px;">{len(gantt_rows)} items · {html.escape(total_duration_label)}</span>
+        </div>
+        <div class="gantt-ruler mono">
+          <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
         </div>
         <div class="gantt-list">
           {"".join(gantt_rows_html)}
@@ -2832,28 +3035,25 @@ def render_dag_html(
           <h2 class="panel-title">Observability &amp; Token Estimate</h2>
           <div class="stats">
             <div class="stat-pill">
-              <span class="muted">Estimated Tokens:</span>
-              <span class="stat-value mono">{int(tok_est.get("total_estimated_tokens", 0)):,}</span>
-            </div>
-            <div class="stat-pill">
-              <span class="muted">Tier-1 Saved:</span>
-              <span class="stat-value stat-success mono">{int(tok_est.get("tier1_saved_tokens", 0)):,}</span>
-            </div>
-            <div class="stat-pill">
               <span class="muted">Gate Checks:</span>
               <span class="stat-value mono">{int(gate_metrics.get("total", 0))} ({int(gate_metrics.get("pass", 0))} pass / {int(gate_metrics.get("fail", 0))} fail)</span>
             </div>
             <div class="stat-pill">
-              <span class="muted">Gate Fail Rate:</span>
+              <span class="muted">Fail Rate:</span>
               <span class="stat-value mono">{float(gate_metrics.get("failure_rate", 0.0)):.1%}</span>
+            </div>
+            <div class="stat-pill">
+              <span class="muted">Tier-1 Saved:</span>
+              <span class="stat-value stat-success mono">{tier1_saved:,}</span>
             </div>
           </div>
         </div>
+        {share_bar_html}
         <div class="obs-grid">
           <div>
             <table class="obs-table">
               <thead>
-                <tr><th>Role</th><th>Calls</th><th>Avg/Call</th><th>Estimated Tokens</th></tr>
+                <tr><th>Role</th><th class="num">Calls</th><th class="num">Avg/Call</th><th class="num">Est. Tokens</th><th class="num">Share</th></tr>
               </thead>
               <tbody>
                 {"".join(role_rows_html)}
@@ -3010,28 +3210,14 @@ def cmd_dag(args: argparse.Namespace) -> int:
     updated = False
     started_override = getattr(args, "started_at", None)
     finished_override = getattr(args, "finished_at", None)
+    fallback_start = state.get("created_at") or state.get("updated_at") or now
 
     for ph in state.get("phases", []):
         ph.setdefault("started_at", None)
         ph.setdefault("finished_at", None)
         ph.setdefault("duration_s", None)
         ph.setdefault("interrogator_calls", 0)
-
-        if args.phase and ph.get("id") == args.phase:
-            if args.gate_status:
-                ph["gate_status"] = args.gate_status
-                if args.gate_status in INTERROGATOR_CALL_STATUSES:
-                    ph["interrogator_calls"] = int(ph.get("interrogator_calls") or 0) + 1
-            if args.note is not None:
-                ph["gate_note"] = args.note
-            apply_status_timestamps(
-                ph,
-                args.gate_status,
-                now,
-                started_override=started_override,
-                finished_override=finished_override,
-            )
-            updated = True
+        phase_fallback_start = ph.get("started_at") or fallback_start
 
         for node in ph.get("nodes", []):
             node.setdefault("started_at", None)
@@ -3065,11 +3251,52 @@ def cmd_dag(args: argparse.Namespace) -> int:
                     now,
                     started_override=started_override,
                     finished_override=finished_override,
+                    fallback_started_at=phase_fallback_start,
                 )
-                if node.get("started_at") and not ph.get("started_at"):
+                node_start_ts = parse_iso_timestamp(node.get("started_at"))
+                ph_start_ts = parse_iso_timestamp(ph.get("started_at"))
+                if node.get("started_at") and (
+                    ph_start_ts is None or (node_start_ts is not None and node_start_ts < ph_start_ts)
+                ):
                     ph["started_at"] = node["started_at"]
                     ph["duration_s"] = compute_duration_s(ph.get("started_at"), ph.get("finished_at"))
                 updated = True
+
+        node_starts = [
+            (parse_iso_timestamp(n.get("started_at")), n.get("started_at"))
+            for n in ph.get("nodes", [])
+            if parse_iso_timestamp(n.get("started_at")) is not None
+        ]
+        earliest_node_start = min(node_starts, key=lambda pair: pair[0])[1] if node_starts else None
+        node_finishes = [
+            (parse_iso_timestamp(n.get("finished_at")), n.get("finished_at"))
+            for n in ph.get("nodes", [])
+            if parse_iso_timestamp(n.get("finished_at")) is not None
+        ]
+        latest_node_finish = max(node_finishes, key=lambda pair: pair[0])[1] if node_finishes else None
+
+        if args.phase and ph.get("id") == args.phase:
+            if args.gate_status:
+                ph["gate_status"] = args.gate_status
+                if args.gate_status in INTERROGATOR_CALL_STATUSES:
+                    ph["interrogator_calls"] = int(ph.get("interrogator_calls") or 0) + 1
+            if args.note is not None:
+                ph["gate_note"] = args.note
+            apply_status_timestamps(
+                ph,
+                args.gate_status,
+                now,
+                started_override=started_override,
+                finished_override=finished_override,
+                fallback_started_at=earliest_node_start or fallback_start,
+            )
+            if ph.get("finished_at") and latest_node_finish and not finished_override:
+                ph_fin_ts = parse_iso_timestamp(ph.get("finished_at"))
+                latest_ts = parse_iso_timestamp(latest_node_finish)
+                if ph_fin_ts is not None and latest_ts is not None and latest_ts > ph_fin_ts:
+                    ph["finished_at"] = latest_node_finish
+                    ph["duration_s"] = compute_duration_s(ph.get("started_at"), ph.get("finished_at"))
+            updated = True
 
     missing_nodes = sorted(set(batch_updates.keys()) - matched_batch)
     if missing_nodes:
